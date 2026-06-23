@@ -35,25 +35,13 @@ using wsl::windows::service::wslc::WSLCExecutionContext;
 using wsl::windows::service::wslc::WSLCSession;
 using wsl::windows::service::wslc::WSLCVirtualMachine;
 
-constexpr auto c_containerdStorage = "/var/lib/containers";
-constexpr auto c_containerdSocket = "/run/containerd/containerd.sock";
-constexpr auto c_dockerdReadyLogLine = "API service listening on";
+constexpr auto c_engineStorage = "/var/lib/containers";
+constexpr auto c_engineReadyLogLine = "API service listening on";
+constexpr auto c_engineNetworkStorage = "/etc/containers/networks";
+constexpr auto c_engineNetworkStorageOverlayUpper = "/var/lib/containers/etc-containers-networks/upper";
+constexpr auto c_engineNetworkStorageOverlayWork = "/var/lib/containers/etc-containers-networks/work";
 constexpr DWORD c_processTerminateTimeoutMs = 30 * 1000;
 constexpr DWORD c_processKillTimeoutMs = 10 * 1000;
-
-// podman/netavark stores network definitions in c_containerNetworkConfig, which is on the ephemeral
-// system rootfs; c_persistentContainerNetworks lives under the storage.vhdx mount (/var/lib/containers)
-// and persists across session restarts. See PersistNetworkConfig.
-constexpr auto c_containerNetworkConfig = "/etc/containers/networks";
-// Persistent backing for c_containerNetworkConfig (the overlay upperdir). The name mirrors the
-// /etc/containers/networks path it backs so the relationship is obvious at a glance, and it must
-// live under the storage.vhdx (ext4) mount - it cannot be on the overlayfs rootfs.
-constexpr auto c_persistentContainerNetworks = "/var/lib/containers/etc-containers-networks";
-// overlay scratch dir for the network-config mount. Must live on the same
-// (storage.vhdx, ext4) filesystem as the upperdir, and must NOT be on the
-// overlayfs rootfs - overlayfs rejects an overlayfs dir as workdir/upperdir.
-constexpr auto c_persistentContainerNetworksWork = "/var/lib/containers/etc-containers-networks.work";
-constexpr DWORD c_networkConfigSetupTimeoutMs = 30 * 1000;
 
 namespace {
 
@@ -436,6 +424,8 @@ try
     // Podman needs /dev/shm (tmpfs) for its shm-based lock manager.
     m_virtualMachine->Mount("", "/dev/shm", "tmpfs", "rw,nosuid,nodev", 0);
 
+    MountEngineNetworkStorageOverlay();
+
     // Mirror the host's trusted root CAs into the VM before dockerd starts.
     InstallTrustedRootCertificates();
 
@@ -457,25 +447,9 @@ try
     // Monitor for unexpected VM exit.
     m_ioRelay.AddHandle(std::make_unique<windows::common::io::EventHandle>(m_vmExitedEvent.get(), std::bind(&WSLCSession::OnVmExited, this)));
 
-    // Recover any existing resources from storage. A failure here must not crash the session host
-    // or abort session creation. In particular, podman's compat /containers/json can return HTTP 500
-    // ("getting graph driver info ...: readlink <graphroot>/overlay: invalid argument") for a
-    // non-running container after an unclean session restart - an upstream containers-storage overlay
-    // graph-driver issue (see containers/podman#19090), not a fault on our side. Log and continue so
-    // the session still comes up rather than taking down the process.
-    // Recover each resource kind under its own guard so a failure recovering one
-    // (e.g. the podman#19090 overlay graph-driver 500 above) does not skip the other.
-    try
-    {
-        RecoverExistingNetworks();
-    }
-    CATCH_LOG();
-
-    try
-    {
-        RecoverExistingContainers();
-    }
-    CATCH_LOG();
+    // Recover any existing resources from storage.
+    RecoverExistingNetworks();
+    RecoverExistingContainers();
 
     errorCleanup.release();
     return S_OK;
@@ -504,7 +478,7 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
     if (Settings.StoragePath == nullptr)
     {
         // If no storage path is specified, use a tmpfs for convenience.
-        m_virtualMachine->Mount("", c_containerdStorage, "tmpfs", "", 0);
+        m_virtualMachine->Mount("", c_engineStorage, "tmpfs", "", 0);
         return;
     }
 
@@ -564,11 +538,7 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
     }
 
     // Mount the device to /root.
-    m_virtualMachine->Mount(diskDevice.c_str(), c_containerdStorage, "ext4", "", 0);
-
-    // Back podman's network config dir with the persistent storage we just mounted, so that
-    // user-created networks survive a session restart (only meaningful for persistent storage).
-    PersistNetworkConfig();
+    m_virtualMachine->Mount(diskDevice.c_str(), c_engineStorage, "ext4", "", 0);
 
     // Configure swap on a separate ephemeral VHD.
     if (Settings.SwapSizeMb > 0)
@@ -594,61 +564,6 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
     }
 
     deleteVhdOnFailure.release();
-}
-
-void WSLCSession::PersistNetworkConfig()
-{
-    // podman/netavark stores network definitions in c_containerNetworkConfig (/etc/containers/
-    // networks), which lives on the ephemeral system rootfs and comes up empty on every session
-    // restart (fresh VM) - so user-created networks would be lost. The storage.vhdx mount
-    // (/var/lib/containers) is the only persistent location, so make the network dir durable with
-    // an overlay: lowerdir is the baked /etc/containers/networks (read-only, on the rootfs),
-    // upperdir is the persistent dir on storage.vhdx, and the overlay is mounted back over
-    // /etc/containers/networks. podman keeps using its default network dir, now a merged view, so
-    // custom networks land in the persistent upper and survive a restart, while the baked default
-    // network shows through from the lower with no seeding. (dockerd kept networks under its
-    // data-root, so this came for free before podman.)
-    //
-    // We use overlay instead of a bind mount so the baked default network is visible via the lower
-    // layer (no copy/seed step) and tracks the current system.vhd, while only user changes are
-    // written to the persistent upper. upperdir/workdir MUST be on the storage.vhdx (ext4) mount:
-    // the rootfs is itself overlayfs, and overlayfs cannot serve as an overlay upperdir/workdir.
-    // The workdir is pure overlay scratch, recreated each session in case an unclean shutdown left
-    // a stale one behind.
-    //
-    // Best-effort: if the directory setup or the overlay mount fails, CATCH_LOG swallows it and the
-    // baked /etc/containers/networks stays intact, so the session still works - just without
-    // cross-restart network persistence.
-    try
-    {
-        // Create the persistent upper and a fresh overlay workdir on storage.vhdx. There is no
-        // directory-creation helper, so this stays a small shell step; overlay requires both dirs to
-        // exist before the mount, and the workdir is recreated in case an unclean shutdown left one.
-        const auto script = std::format(
-            "set -e; mkdir -p {0}; rm -rf {1}; mkdir -p {1}",
-            c_persistentContainerNetworks,
-            c_persistentContainerNetworksWork);
-        ServiceProcessLauncher launcher("/bin/sh", {"/bin/sh", "-c", script}, {{"PATH=/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/sbin"}});
-        auto process = launcher.Launch(*m_virtualMachine);
-        const auto code = process.Wait(c_networkConfigSetupTimeoutMs);
-        THROW_HR_IF_MSG(E_FAIL, code != 0, "Network config dir setup exited with code %d", code);
-
-        // Mount the overlay through the VM mount helper (the same path used for the rootfs/modules
-        // mounts) so /etc/containers/networks becomes a merged view of the baked default network
-        // (lower) and the persistent user networks (upper).
-        const auto options = std::format(
-            "lowerdir={0},upperdir={1},workdir={2}",
-            c_containerNetworkConfig,
-            c_persistentContainerNetworks,
-            c_persistentContainerNetworksWork);
-        m_virtualMachine->Mount("overlay", c_containerNetworkConfig, "overlay", options.c_str(), WSLCMountFlagsNone);
-
-        // Logged so the symptom of a failure here ("custom networks vanish after a session restart")
-        // is traceable: its absence in the logs points back to this step. The failure path is
-        // captured by CATCH_LOG below.
-        WSL_LOG("NetworkConfigPersisted", TraceLoggingValue(m_displayName.c_str(), "SessionName"));
-    }
-    CATCH_LOG();
 }
 
 HRESULT WSLCSession::GetId(ULONG* Id)
@@ -716,7 +631,7 @@ try
 
     if (!m_dockerdReadyEvent.is_signaled())
     {
-        if (entry.find(c_dockerdReadyLogLine) != std::string::npos)
+        if (entry.find(c_engineReadyLogLine) != std::string::npos)
         {
             m_dockerdReadyEvent.SetEvent();
         }
@@ -1153,7 +1068,7 @@ try
 
     WSL_LOG("BuildImageStart", TraceLoggingValue(wsl::shared::string::Join(buildArgs, ' ').c_str(), "Command"));
 
-    const auto buildTmpDir = std::format("{}/tmp", c_containerdStorage);
+    const auto buildTmpDir = std::format("{}/tmp", c_engineStorage);
     {
         ServiceProcessLauncher mkdirLauncher("/bin/mkdir", {"/bin/mkdir", "-p", buildTmpDir});
         const int mkdirExit = mkdirLauncher.Launch(*m_virtualMachine).Wait();
@@ -1384,8 +1299,7 @@ void WSLCSession::ImportImageImpl(
         OnResponseChunk(buffer);
     };
 
-    io.AddHandle(
-        std::make_unique<DockerHTTPClient::DockerHttpResponseHandle>(Request, std::move(onHttpResponse), std::move(onProgress)));
+    io.AddHandle(std::make_unique<DockerHTTPClient::DockerHttpResponseHandle>(Request, std::move(onHttpResponse), std::move(onProgress)));
 
     io.Run({});
 
@@ -3040,7 +2954,7 @@ try
 
             // Flush the storage filesystem to its backing VHD before the VM is torn down. Under podman,
             // stopping the system service above does NOT stop conmon-managed running containers, so a
-            // running container's overlay keeps c_containerdStorage busy and the Unmount below fails
+            // running container's overlay keeps c_engineStorage busy and the Unmount below fails
             // (EBUSY) without ever syncing. Detaching the storage disk issues a sync() in the guest first
             // (see the WSLC_DETACH handler), making recently-written overlay metadata durable so the next
             // session over this VHD doesn't hit a corrupt overlay store ("readlink .../overlay: invalid
@@ -3051,7 +2965,7 @@ try
                 // hold the storage filesystem busy when the disk is detached/unmounted below.
                 try
                 {
-                    m_virtualMachine->Unmount(c_containerNetworkConfig);
+                    m_virtualMachine->Unmount(c_engineNetworkStorage);
                 }
                 CATCH_LOG();
 
@@ -3065,7 +2979,7 @@ try
 
             try
             {
-                m_virtualMachine->Unmount(c_containerdStorage);
+                m_virtualMachine->Unmount(c_engineStorage);
             }
             CATCH_LOG();
         }
@@ -3675,6 +3589,25 @@ void WSLCSession::RecoverExistingNetworks()
         "NetworksRecovered",
         TraceLoggingValue(m_displayName.c_str(), "SessionName"),
         TraceLoggingValue(m_networks.size(), "NetworkCount"));
+}
+
+void WSLCSession::MountEngineNetworkStorageOverlay()
+{
+    //
+    // podman stores network configurations in c_engineNetworkStorage.
+    // And creates the default network configuration at install time.
+    // Mount a overlay over it with upper and work directories in the storage mount.
+    //
+
+    ServiceProcessLauncher launcher("/bin/mkdir", {"/bin/mkdir", "-p", c_engineNetworkStorageOverlayUpper, c_engineNetworkStorageOverlayWork});
+    const auto code = launcher.Launch(*m_virtualMachine).Wait();
+    THROW_HR_IF_MSG(E_FAIL, code != 0, "Failed to create folders for engine network storage overlay: %d", code);
+
+    const auto options =
+        std::format("lowerdir={0},upperdir={1},workdir={2}", c_engineNetworkStorage, c_engineNetworkStorageOverlayUpper, c_engineNetworkStorageOverlayWork);
+    m_virtualMachine->Mount("overlay", c_engineNetworkStorage, "overlay", options.c_str(), WSLCMountFlagsNone);
+
+    WSL_LOG("EngineNetworkStorageOverlayMounted", TraceLoggingValue(m_displayName.c_str(), "SessionName"));
 }
 
 } // namespace wsl::windows::service::wslc

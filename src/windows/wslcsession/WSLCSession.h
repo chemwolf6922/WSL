@@ -264,7 +264,6 @@ private:
     void CreateContainerImpl(const WSLCContainerOptions* Options, IWSLCContainer** Container);
 
     void ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID UserSid);
-    void PersistNetworkConfig();
     void Ext4Format(const std::string& Device);
     _Requires_shared_lock_held_(m_lock)
     std::string InspectImageLockHeld(const std::string& Id);
@@ -296,6 +295,8 @@ private:
 
     void SaveImageImpl(std::pair<uint32_t, wil::unique_socket>& RequestCodePair, WSLCHandle OutputHandle, HANDLE CancelEvent);
     void StreamImageOperation(DockerHTTPClient::HTTPRequestContext& requestContext, LPCSTR Image, LPCSTR OperationName, IProgressCallback* ProgressCallback);
+
+    void MountEngineNetworkStorageOverlay();
 
     std::optional<DockerHTTPClient> m_dockerClient;
     std::optional<WSLCVirtualMachine> m_virtualMachine;
