@@ -305,7 +305,6 @@ private:
     std::wstring m_displayName;
     std::wstring m_creatorProcessName;
     std::filesystem::path m_storageVhdPath;
-    std::optional<ULONG> m_storageDiskLun;
     std::filesystem::path m_swapVhdPath;
 
     // N.B. m_lock must be acquired before acquiring m_containersLock or m_networksLock.

@@ -42,6 +42,7 @@ constexpr auto c_engineNetworkStorageOverlayUpper = "/var/lib/containers/etc-con
 constexpr auto c_engineNetworkStorageOverlayWork = "/var/lib/containers/etc-containers-networks/work";
 constexpr DWORD c_processTerminateTimeoutMs = 30 * 1000;
 constexpr DWORD c_processKillTimeoutMs = 10 * 1000;
+constexpr ULONG c_terminateStopContainerTimeoutSeconds = 10;
 
 namespace {
 
@@ -503,11 +504,8 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
         }
     });
 
-    auto result = wil::ResultFromException([&]() {
-        auto [attachedLun, attachedDevice] = m_virtualMachine->AttachDisk(m_storageVhdPath.c_str(), false);
-        m_storageDiskLun = attachedLun;
-        diskDevice = std::move(attachedDevice);
-    });
+    auto result =
+        wil::ResultFromException([&]() { diskDevice = m_virtualMachine->AttachDisk(m_storageVhdPath.c_str(), false).second; });
 
     if (FAILED(result))
     {
@@ -531,7 +529,6 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
 
         // Then attach the new disk.
         std::tie(diskLun, diskDevice) = m_virtualMachine->AttachDisk(m_storageVhdPath.c_str(), false);
-        m_storageDiskLun = diskLun;
 
         // Then format it.
         m_virtualMachine->Ext4Format(diskDevice);
@@ -2901,6 +2898,30 @@ try
     std::lock_guard containersLock(m_containersLock);
     std::lock_guard networksLock(m_networksLock);
 
+    // Stopping the `podman system service` process during teardown does not
+    // stop the containers it launched, so stop them explicitly while the VM is still alive. Call
+    // /stop directly -- WSLCContainerImpl::Stop() aborts on the already-signaled terminating event.
+    // TODO: do this in parallel.
+    if (m_dockerClient.has_value() && (!m_vmExitedEvent || !m_vmExitedEvent.is_signaled()))
+    {
+        for (const auto& [id, container] : m_containers)
+        {
+            if (container->State() != WslcContainerStateRunning)
+            {
+                continue;
+            }
+
+            try
+            {
+                m_dockerClient->StopContainer(id, std::nullopt, c_terminateStopContainerTimeoutSeconds);
+            }
+            catch (...)
+            {
+                LOG_CAUGHT_EXCEPTION_MSG("Failed to stop container '%hs' during session teardown", id.c_str());
+            }
+        }
+    }
+
     m_containers.clear();
     m_volumes.reset();
     m_networks.clear();
@@ -2950,31 +2971,6 @@ try
             {
                 auto podmanExitCode = StopProcess(m_podmanSystemServiceProcess.value(), c_processTerminateTimeoutMs, c_processKillTimeoutMs);
                 WSL_LOG("PodmanSystemServiceExit", TraceLoggingValue(podmanExitCode, "code"));
-            }
-
-            // Flush the storage filesystem to its backing VHD before the VM is torn down. Under podman,
-            // stopping the system service above does NOT stop conmon-managed running containers, so a
-            // running container's overlay keeps c_engineStorage busy and the Unmount below fails
-            // (EBUSY) without ever syncing. Detaching the storage disk issues a sync() in the guest first
-            // (see the WSLC_DETACH handler), making recently-written overlay metadata durable so the next
-            // session over this VHD doesn't hit a corrupt overlay store ("readlink .../overlay: invalid
-            // argument" 500, containers/podman#19090).
-            if (m_storageDiskLun.has_value())
-            {
-                // Release the network-config bind mount (PersistNetworkConfig) first so it doesn't
-                // hold the storage filesystem busy when the disk is detached/unmounted below.
-                try
-                {
-                    m_virtualMachine->Unmount(c_engineNetworkStorage);
-                }
-                CATCH_LOG();
-
-                try
-                {
-                    m_virtualMachine->DetachDisk(m_storageDiskLun.value());
-                    m_storageDiskLun.reset();
-                }
-                CATCH_LOG();
             }
 
             try
