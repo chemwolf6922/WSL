@@ -42,10 +42,17 @@ constexpr DWORD c_processTerminateTimeoutMs = 30 * 1000;
 constexpr DWORD c_processKillTimeoutMs = 10 * 1000;
 
 // podman/netavark stores network definitions in c_containerNetworkConfig, which is on the ephemeral
-// system rootfs; c_persistentContainerNetworks lives under the storage.vhdx mount (c_containerdStorage)
+// system rootfs; c_persistentContainerNetworks lives under the storage.vhdx mount (/var/lib/containers)
 // and persists across session restarts. See PersistNetworkConfig.
 constexpr auto c_containerNetworkConfig = "/etc/containers/networks";
-constexpr auto c_persistentContainerNetworks = "/var/lib/containers/networks";
+// Persistent backing for c_containerNetworkConfig (the overlay upperdir). The name mirrors the
+// /etc/containers/networks path it backs so the relationship is obvious at a glance, and it must
+// live under the storage.vhdx (ext4) mount - it cannot be on the overlayfs rootfs.
+constexpr auto c_persistentContainerNetworks = "/var/lib/containers/etc-containers-networks";
+// overlay scratch dir for the network-config mount. Must live on the same
+// (storage.vhdx, ext4) filesystem as the upperdir, and must NOT be on the
+// overlayfs rootfs - overlayfs rejects an overlayfs dir as workdir/upperdir.
+constexpr auto c_persistentContainerNetworksWork = "/var/lib/containers/etc-containers-networks.work";
 constexpr DWORD c_networkConfigSetupTimeoutMs = 30 * 1000;
 
 namespace {
@@ -594,22 +601,32 @@ void WSLCSession::PersistNetworkConfig()
     // podman/netavark stores network definitions in c_containerNetworkConfig (/etc/containers/
     // networks), which lives on the ephemeral system rootfs and comes up empty on every session
     // restart (fresh VM) - so user-created networks would be lost. The storage.vhdx mount
-    // (c_containerdStorage) is the only persistent location, so back the network dir with it via a
-    // bind mount: seed the baked default network (keeping its fixed id) into the persistent dir on
-    // first use, then bind that dir over /etc/containers/networks. podman keeps using its default
-    // network dir, now durable, so custom networks survive a restart and RecoverExistingNetworks can
-    // find them. (dockerd kept networks under its data-root, so this came for free before podman.)
+    // (/var/lib/containers) is the only persistent location, so make the network dir durable with
+    // an overlay: lowerdir is the baked /etc/containers/networks (read-only, on the rootfs),
+    // upperdir is the persistent dir on storage.vhdx, and the overlay is mounted back over
+    // /etc/containers/networks. podman keeps using its default network dir, now a merged view, so
+    // custom networks land in the persistent upper and survive a restart, while the baked default
+    // network shows through from the lower with no seeding. (dockerd kept networks under its
+    // data-root, so this came for free before podman.)
     //
-    // Best-effort: `set -e` aborts before the bind if seeding fails, leaving the baked
+    // We use overlay instead of a bind mount so the baked default network is visible via the lower
+    // layer (no copy/seed step) and tracks the current system.vhd, while only user changes are
+    // written to the persistent upper. upperdir/workdir MUST be on the storage.vhdx (ext4) mount:
+    // the rootfs is itself overlayfs, and overlayfs cannot serve as an overlay upperdir/workdir.
+    // The workdir is pure overlay scratch, recreated each session in case an unclean shutdown left
+    // a stale one behind.
+    //
+    // Best-effort: `set -e` aborts before the overlay mount if setup fails, leaving the baked
     // /etc/containers/networks intact, so the session still works - just without cross-restart
     // network persistence.
     const auto script = std::format(
         "set -e; "
         "mkdir -p {1}; "
-        "[ -f {1}/podman.json ] || cp {0}/podman.json {1}/podman.json; "
-        "mount --bind {1} {0}",
+        "rm -rf {2}; mkdir -p {2}; "
+        "mount -t overlay overlay -o lowerdir={0},upperdir={1},workdir={2} {0}",
         c_containerNetworkConfig,
-        c_persistentContainerNetworks);
+        c_persistentContainerNetworks,
+        c_persistentContainerNetworksWork);
 
     try
     {
