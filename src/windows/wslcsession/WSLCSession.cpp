@@ -616,24 +616,32 @@ void WSLCSession::PersistNetworkConfig()
     // The workdir is pure overlay scratch, recreated each session in case an unclean shutdown left
     // a stale one behind.
     //
-    // Best-effort: `set -e` aborts before the overlay mount if setup fails, leaving the baked
-    // /etc/containers/networks intact, so the session still works - just without cross-restart
-    // network persistence.
-    const auto script = std::format(
-        "set -e; "
-        "mkdir -p {1}; "
-        "rm -rf {2}; mkdir -p {2}; "
-        "mount -t overlay overlay -o lowerdir={0},upperdir={1},workdir={2} {0}",
-        c_containerNetworkConfig,
-        c_persistentContainerNetworks,
-        c_persistentContainerNetworksWork);
-
+    // Best-effort: if the directory setup or the overlay mount fails, CATCH_LOG swallows it and the
+    // baked /etc/containers/networks stays intact, so the session still works - just without
+    // cross-restart network persistence.
     try
     {
+        // Create the persistent upper and a fresh overlay workdir on storage.vhdx. There is no
+        // directory-creation helper, so this stays a small shell step; overlay requires both dirs to
+        // exist before the mount, and the workdir is recreated in case an unclean shutdown left one.
+        const auto script = std::format(
+            "set -e; mkdir -p {0}; rm -rf {1}; mkdir -p {1}",
+            c_persistentContainerNetworks,
+            c_persistentContainerNetworksWork);
         ServiceProcessLauncher launcher("/bin/sh", {"/bin/sh", "-c", script}, {{"PATH=/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/sbin"}});
         auto process = launcher.Launch(*m_virtualMachine);
         const auto code = process.Wait(c_networkConfigSetupTimeoutMs);
-        THROW_HR_IF_MSG(E_FAIL, code != 0, "Network config persistence setup exited with code %d", code);
+        THROW_HR_IF_MSG(E_FAIL, code != 0, "Network config dir setup exited with code %d", code);
+
+        // Mount the overlay through the VM mount helper (the same path used for the rootfs/modules
+        // mounts) so /etc/containers/networks becomes a merged view of the baked default network
+        // (lower) and the persistent user networks (upper).
+        const auto options = std::format(
+            "lowerdir={0},upperdir={1},workdir={2}",
+            c_containerNetworkConfig,
+            c_persistentContainerNetworks,
+            c_persistentContainerNetworksWork);
+        m_virtualMachine->Mount("overlay", c_containerNetworkConfig, "overlay", options.c_str(), WSLCMountFlagsNone);
 
         // Logged so the symptom of a failure here ("custom networks vanish after a session restart")
         // is traceable: its absence in the logs points back to this step. The failure path is
