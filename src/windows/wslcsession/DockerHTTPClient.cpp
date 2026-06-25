@@ -117,6 +117,11 @@ std::string DockerHTTPClient::URL::Escape(const std::string& Value)
 DockerHTTPClient::DockerHTTPClient(wsl::shared::SocketChannel&& Channel, HANDLE exitingEvent, GUID VmId, ULONG ConnectTimeoutMs) :
     m_exitingEvent(exitingEvent), m_channel(std::move(Channel)), m_vmId(VmId), m_connectTimeoutMs(ConnectTimeoutMs)
 {
+    // m_channel was forked from the init channel in WSLCSession::Initialize and copied its exit
+    // events, including the session terminating event. That event is signaled at the start of
+    // WSLCSession::Terminate(), so leaving it would abort the teardown's StopContainer() and corrupt
+    // the engine storage. Abort only on the VM event.
+    m_channel.SetExitEvents({m_exitingEvent});
 }
 
 std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::PullImage(
