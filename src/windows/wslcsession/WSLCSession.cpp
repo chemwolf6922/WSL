@@ -990,26 +990,24 @@ try
     //   2. podman expects stdin to be a pipe but it's a socket.
     // So we stage the Dockerfile to a real file in the VM and pass `-f <path>`.
     //
-    GUID stageId{};
-    THROW_IF_FAILED(CoCreateGuid(&stageId));
 
-    std::vector<char> dockerfile;
+    std::vector<char> dockerfileContent;
     while (true)
     {
         constexpr DWORD c_chunkSize = 64 * 1024;
-        const size_t offset = dockerfile.size();
-        dockerfile.resize(offset + c_chunkSize);
+        const size_t offset = dockerfileContent.size();
+        dockerfileContent.resize(offset + c_chunkSize);
 
         DWORD bytesRead = 0;
-        if (!::ReadFile(buildFileHandle.Get(), dockerfile.data() + offset, c_chunkSize, &bytesRead, nullptr))
+        if (!::ReadFile(buildFileHandle.Get(), dockerfileContent.data() + offset, c_chunkSize, &bytesRead, nullptr))
         {
             // A piped Dockerfile signals EOF by failing the read with ERROR_BROKEN_PIPE.
             THROW_LAST_ERROR_IF(::GetLastError() != ERROR_BROKEN_PIPE);
-            dockerfile.resize(offset);
+            dockerfileContent.resize(offset);
             break;
         }
 
-        dockerfile.resize(offset + bytesRead);
+        dockerfileContent.resize(offset + bytesRead);
         if (bytesRead == 0)
         {
             // EOF on a regular handle.
@@ -1017,25 +1015,22 @@ try
         }
     }
 
-    const auto buildScratchDir = std::format("/tmp/wslc-build-{}", wsl::shared::string::GuidToString<char>(stageId));
-    {
-        ServiceProcessLauncher mkdirLauncher("/bin/mkdir", {"/bin/mkdir", "-p", buildScratchDir});
-        const int mkdirExit = mkdirLauncher.Launch(*m_virtualMachine).Wait();
-        THROW_HR_IF_MSG(E_FAIL, mkdirExit != 0, "Failed to create build scratch dir %hs (exit %i)", buildScratchDir.c_str(), mkdirExit);
-    }
+    GUID stageId{};
+    THROW_IF_FAILED(CoCreateGuid(&stageId));
+    const auto stagedDockerfile = std::format("/tmp/dockerfile-{}", wsl::shared::string::GuidToString<char>(stageId));
+
     auto cleanupScratch = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
-        ServiceProcessLauncher rmLauncher("/bin/rm", {"/bin/rm", "-rf", buildScratchDir});
+        ServiceProcessLauncher rmLauncher("/bin/rm", {"/bin/rm", "-f", stagedDockerfile});
         rmLauncher.Launch(*m_virtualMachine).Wait();
     });
 
-    const auto stagedDockerfile = std::format("{}/Containerfile", buildScratchDir);
     {
         const auto script = std::format("cat > '{}'", stagedDockerfile);
         ServiceProcessLauncher catLauncher("/bin/sh", {"/bin/sh", "--norc", "-c", script}, {}, WSLCProcessFlagsStdin);
         auto catProcess = catLauncher.Launch(*m_virtualMachine);
 
         std::vector<std::unique_ptr<OverlappedIOHandle>> extraHandles;
-        extraHandles.emplace_back(std::make_unique<WriteHandle>(catProcess.GetStdHandle(WSLCFDStdin), std::move(dockerfile)));
+        extraHandles.emplace_back(std::make_unique<WriteHandle>(catProcess.GetStdHandle(WSLCFDStdin), std::move(dockerfileContent)));
 
         const auto result = catProcess.WaitAndCaptureOutput(60000UL, std::move(extraHandles));
         THROW_HR_IF_MSG(E_FAIL, result.Code != 0, "Failed to stage Dockerfile: %hs", catLauncher.FormatResult(result).c_str());

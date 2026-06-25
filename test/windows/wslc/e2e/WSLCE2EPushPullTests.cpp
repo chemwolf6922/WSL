@@ -88,25 +88,18 @@ class WSLCE2EPushPullTests
     WSLC_TEST_METHOD(WSLCE2E_Image_Push_NonExistentImage)
     {
         auto result = RunWslc(L"push does-not-exist:latest");
-        // docker: "An image does not exist locally with the tag: X" —
-        // podman: "failed to find image X: image not known".
-        // Verify image name in stderr.
-        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
-        auto stderrText = result.Stderr.value_or(L"");
-        VERIFY_IS_TRUE(stderrText.find(L"does-not-exist") != std::wstring::npos);
+        auto errorMessage =
+            L"failed to find image docker.io/library/does-not-exist:latest: docker.io/library/does-not-exist:latest: image not "
+            L"known\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n";
+        result.Verify({.Stdout = L"", .Stderr = errorMessage, .ExitCode = 1});
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Image_Pull_NonExistentImage)
     {
         auto result = RunWslc(L"pull does-not-exist:latest");
-        // docker: "pull access denied for X, repository does not exist..."
-        // podman: {"message":"denied: requested access to the resource is denied"}
-        // (pull error path doesn't extract .message yet — separate sub-bug;
-        // for now substring-match on the "denied" keyword which is present
-        // in both engines' wording.)
-        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
-        auto stderrText = result.Stderr.value_or(L"");
-        VERIFY_IS_TRUE(stderrText.find(L"denied") != std::wstring::npos);
+        auto errorMessage =
+            L"{\"message\":\"denied: requested access to the resource is denied\"}\r\n\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n";
+        result.Verify({.Stdout = L"", .Stderr = errorMessage, .ExitCode = 1});
     }
 
 private:
