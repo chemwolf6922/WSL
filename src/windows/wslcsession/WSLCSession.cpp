@@ -423,9 +423,6 @@ try
     // Configure storage.
     ConfigureStorage(*Settings, tokenInfo->User.Sid);
 
-    // Podman needs /dev/shm (tmpfs) for its shm-based lock manager.
-    m_virtualMachine->Mount("", "/dev/shm", "tmpfs", "rw,nosuid,nodev", 0);
-
     MountEngineNetworkStorageOverlay();
 
     // Mirror the host's trusted root CAs into the VM before dockerd starts.
@@ -987,139 +984,73 @@ try
         buildArgs.push_back(Options->Labels.Values[i]);
     }
 
-    // -----------------------------------------------------------------------
-    // Dockerfile staging
-    // -----------------------------------------------------------------------
     //
-    // Goal: make the user-supplied Dockerfile available to `podman build` at a
-    // path that podman/buildah will accept.
+    // `podman build -f -` does not work:
+    //   1. podman uses the /dev/stdin link but it's missing.
+    //   2. podman expects stdin to be a pipe but it's a socket.
+    // So we stage the Dockerfile to a real file in the VM and pass `-f <path>`.
     //
-    // History — what did NOT work, and why:
-    //
-    //   1. `docker build -f - <ctx>` (the original approach for the docker
-    //      backend) — podman/buildah does NOT recognize `-f -` as a stdin
-    //      shorthand. It treats `-` as a literal path *relative to the build
-    //      context*, then stats `<ctx>/-` and fails with "no such file".
-    //
-    //   2. `podman build -f /dev/stdin <ctx>` — same outcome. Buildah resolves
-    //      *every* `-f` argument relative to the build context, even ones that
-    //      look absolute, so it ends up stat'ing `<ctx>/dev/stdin`. An
-    //      otherwise-valid absolute path is therefore rejected if it happens
-    //      to start with `/dev/`.
-    //
-    //   3. Spawning `sh -c 'cat > Containerfile'` inside the VM and piping the
-    //      bytes via stdin — the cat process hung forever waiting for EOF.
-    //      Closing the Windows-side write end of the pipe does NOT propagate
-    //      as EOF through the multi-layer wslc process-IO IPC chain (Win pipe
-    //      → m_ioRelay → hvsocket → in-VM IO → Linux pipe → process stdin)
-    //      under the ServiceProcessLauncher path. The helper never exits.
-    //
-    // What we do instead: write the Dockerfile to a Windows-side temp dir,
-    // mount that dir read-only into the VM via the same MountWindowsFolder
-    // machinery we already use for the build context, and point `podman build
-    // -f` at the Containerfile under that mount. Absolute paths that point
-    // OUTSIDE the build context (e.g. /mnt/wslc-build-<GUID>/Containerfile)
-    // ARE honored verbatim by buildah, so this resolves cleanly.
-    //
-    // Pros: no helper process, no stdin EOF propagation, no extra in-VM state
-    // to clean up. Cons: an extra 9P mount per build (~tens of ms) and a small
-    // amount of disk I/O on the host. Both are noise compared to the actual
-    // image build time.
     GUID stageId{};
     THROW_IF_FAILED(CoCreateGuid(&stageId));
-    const auto stageIdStr = wsl::shared::string::GuidToString<wchar_t>(stageId);
-    const std::filesystem::path stageDirHost = std::filesystem::temp_directory_path() / (L"wslc-build-" + stageIdStr);
-    const auto stagedDockerfileHost = stageDirHost / L"Containerfile";
 
-    // Make sure the host stage dir is removed on every exit path (success,
-    // throw, or cancellation). The Windows %TEMP% cleanup would eventually
-    // catch leaks, but doing it here keeps things tidy and bounded.
-    std::filesystem::create_directories(stageDirHost);
-    auto cleanupStageHost = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
-        std::error_code ec;
-        std::filesystem::remove_all(stageDirHost, ec);
-    });
-
-    // Stream the Dockerfile bytes from the user-supplied handle to the staged
-    // file. We do this synchronously on the wslcsession thread — Dockerfiles
-    // are tiny (KBs) and the IO is local, so there's no value in async here.
+    std::vector<char> dockerfile;
+    while (true)
     {
-        wil::unique_hfile out(
-            ::CreateFileW(stagedDockerfileHost.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-        THROW_LAST_ERROR_IF(!out.is_valid());
+        constexpr DWORD c_chunkSize = 64 * 1024;
+        const size_t offset = dockerfile.size();
+        dockerfile.resize(offset + c_chunkSize);
 
-        char buf[64 * 1024];
-        while (true)
+        DWORD bytesRead = 0;
+        if (!::ReadFile(buildFileHandle.Get(), dockerfile.data() + offset, c_chunkSize, &bytesRead, nullptr))
         {
-            DWORD bytesRead = 0;
-            if (!::ReadFile(buildFileHandle.Get(), buf, sizeof(buf), &bytesRead, nullptr))
-            {
-                // An anonymous pipe (the common case for a piped Dockerfile) signals EOF by failing the
-                // read with ERROR_BROKEN_PIPE once the write end is closed and all buffered data has been
-                // consumed, rather than returning a zero-byte read. Treat that as a clean end of file.
-                const DWORD error = ::GetLastError();
-                if (error == ERROR_BROKEN_PIPE)
-                {
-                    break;
-                }
+            // A piped Dockerfile signals EOF by failing the read with ERROR_BROKEN_PIPE.
+            THROW_LAST_ERROR_IF(::GetLastError() != ERROR_BROKEN_PIPE);
+            dockerfile.resize(offset);
+            break;
+        }
 
-                THROW_WIN32(error);
-            }
-
-            if (bytesRead == 0)
-            {
-                break; // EOF on user handle — Dockerfile fully copied.
-            }
-
-            DWORD bytesWritten = 0;
-            THROW_LAST_ERROR_IF(!::WriteFile(out.get(), buf, bytesRead, &bytesWritten, nullptr));
-            THROW_HR_IF_MSG(E_FAIL, bytesWritten != bytesRead, "Short write staging Dockerfile (wrote %lu of %lu bytes)", bytesWritten, bytesRead);
+        dockerfile.resize(offset + bytesRead);
+        if (bytesRead == 0)
+        {
+            // EOF on a regular handle.
+            break;
         }
     }
 
-    // Expose the staged Dockerfile to the VM via a separate 9P mount. We use
-    // a different GUID-based path so it never collides with the build-context
-    // mount and so podman/buildah see the file at an absolute path that lies
-    // outside the context (a requirement, as explained above).
-    const auto stageMountPath = std::format("/mnt/wslc-build-{}", wsl::shared::string::GuidToString<char>(stageId));
-    THROW_IF_FAILED(m_virtualMachine->MountWindowsFolder(stageDirHost.c_str(), stageMountPath.c_str(), TRUE));
-    auto unmountStage =
-        wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() { m_virtualMachine->UnmountWindowsFolder(stageMountPath.c_str()); });
+    const auto buildScratchDir = std::format("/tmp/wslc-build-{}", wsl::shared::string::GuidToString<char>(stageId));
+    {
+        ServiceProcessLauncher mkdirLauncher("/bin/mkdir", {"/bin/mkdir", "-p", buildScratchDir});
+        const int mkdirExit = mkdirLauncher.Launch(*m_virtualMachine).Wait();
+        THROW_HR_IF_MSG(E_FAIL, mkdirExit != 0, "Failed to create build scratch dir %hs (exit %i)", buildScratchDir.c_str(), mkdirExit);
+    }
+    auto cleanupScratch = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
+        ServiceProcessLauncher rmLauncher("/bin/rm", {"/bin/rm", "-rf", buildScratchDir});
+        rmLauncher.Launch(*m_virtualMachine).Wait();
+    });
 
-    const auto stagedDockerfile = std::format("{}/Containerfile", stageMountPath);
+    const auto stagedDockerfile = std::format("{}/Containerfile", buildScratchDir);
+    {
+        const auto script = std::format("cat > '{}'", stagedDockerfile);
+        ServiceProcessLauncher catLauncher("/bin/sh", {"/bin/sh", "--norc", "-c", script}, {}, WSLCProcessFlagsStdin);
+        auto catProcess = catLauncher.Launch(*m_virtualMachine);
 
-    // Final podman invocation: `-f <staged absolute path> <context mount>`. No
-    // stdin pipe — the build process doesn't need WSLCProcessFlagsStdin.
+        std::vector<std::unique_ptr<OverlappedIOHandle>> extraHandles;
+        extraHandles.emplace_back(std::make_unique<WriteHandle>(catProcess.GetStdHandle(WSLCFDStdin), std::move(dockerfile)));
+
+        const auto result = catProcess.WaitAndCaptureOutput(60000UL, std::move(extraHandles));
+        THROW_HR_IF_MSG(E_FAIL, result.Code != 0, "Failed to stage Dockerfile: %hs", catLauncher.FormatResult(result).c_str());
+    }
+
     buildArgs.push_back("-f");
     buildArgs.push_back(stagedDockerfile);
     buildArgs.push_back(mountPath);
 
     WSL_LOG("BuildImageStart", TraceLoggingValue(wsl::shared::string::Join(buildArgs, ' ').c_str(), "Command"));
 
-    const auto buildTmpDir = std::format("{}/tmp", c_engineStorage);
-    {
-        ServiceProcessLauncher mkdirLauncher("/bin/mkdir", {"/bin/mkdir", "-p", buildTmpDir});
-        const int mkdirExit = mkdirLauncher.Launch(*m_virtualMachine).Wait();
-        THROW_HR_IF_MSG(E_FAIL, mkdirExit != 0, "Failed to create build temp dir %hs (exit %i)", buildTmpDir.c_str(), mkdirExit);
-    }
-
-    ServiceProcessLauncher buildLauncher(buildArgs[0], buildArgs, {std::format("TMPDIR={}", buildTmpDir)}, WSLCProcessFlagsNone);
+    ServiceProcessLauncher buildLauncher(buildArgs[0], buildArgs, {}, WSLCProcessFlagsNone);
     auto buildProcess = buildLauncher.Launch(*m_virtualMachine);
 
     auto io = CreateIOContext();
-
-    io.AddHandle(
-        std::make_unique<io::RelayHandle<io::ReadHandle>>(buildFileHandle.Get(), common::io::HandleWrapper{buildProcess.GetStdHandle(WSLCFDStdin)}),
-        MultiHandleWait::NeedNotComplete,
-        [&buildProcess]() {
-            // If we receive an error relaying stdin, it could be because the process exited.
-            // Wait up to one second for the process to exit so errors in this relay don't override the actual build result.
-            if (!buildProcess.GetExitEvent().wait(1000))
-            {
-                // Otherwise, throw the error and cancel the build.
-                throw;
-            }
-        });
 
     std::string allOutput;
     auto captureOutput = [&](const gsl::span<char>& content) {

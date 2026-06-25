@@ -1002,6 +1002,11 @@ int WSLCEntryPoint(int Argc, char* Argv[])
         return -1;
     }
 
+    if (UtilMount(nullptr, "/dev/shm", "tmpfs", MS_NOATIME | MS_NOSUID | MS_NODEV, nullptr) < 0)
+    {
+        return -1;
+    }
+
     //
     // Open kmesg for logging and ensure that the file descriptor is not set to one of the standard file descriptors.
     //
