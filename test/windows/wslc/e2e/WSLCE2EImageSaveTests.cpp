@@ -58,11 +58,7 @@ class WSLCE2EImageSaveTests
     WSLC_TEST_METHOD(WSLCE2E_Image_Save_ImageNotFound)
     {
         const auto result = RunWslc(std::format(L"image save --output \"{}\" {}", SavedArchivePath.wstring(), InvalidImage.NameAndTag()));
-        // docker: "reference does not exist" — podman: "failed to find image X: image not known".
-        // Verify the image name appears in stderr.
-        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
-        auto stderrText = result.Stderr.value_or(L"");
-        VERIFY_IS_TRUE(stderrText.find(InvalidImage.NameAndTag()) != std::wstring::npos);
+        result.Verify({.Stdout = L"", .Stderr = L"reference does not exist\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n", .ExitCode = 1});
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Image_Save_Success)
