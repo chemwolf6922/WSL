@@ -1270,34 +1270,34 @@ try
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_dockerClient.has_value());
 
     auto userHandle = OpenUserHandle(ImageHandle);
-    auto requestContext = m_dockerClient->ImportImage(repo, tagOrDigest.value(), ContentSize, userHandle.Get());
+    auto requestContext = m_dockerClient->ImportImage(repo, tag, ContentSize, userHandle.Get());
 
-    auto errorMessage = std::make_shared<std::optional<std::string>>();
-    std::optional<std::string> parsedImageId{std::nullptr};
+    std::optional<std::string> errorMessage{std::nullopt};
+    std::optional<std::string> parsedImageId{std::nullopt};
 
-    auto onResponseChunk = [errorMessage](const gsl::span<char>& buffer) {
+    auto onResponseChunk = [&](const gsl::span<char>& buffer) {
         auto parsed = shared::FromJson<docker_schema::CreateImageProgress>(std::string(buffer.begin(), buffer.end()).c_str());
 
         if (parsed.error.has_value())
         {
-            if (errorMessage->has_value())
+            if (errorMessage.has_value())
             {
                 LOG_HR_MSG(
                     E_UNEXPECTED,
                     "Overriding previous error message '%hs' with new message '%hs'",
-                    (*errorMessage)->c_str(),
+                    errorMessage->c_str(),
                     parsed.error->c_str());
             }
 
-            *errorMessage = std::move(parsed.error);
+            errorMessage = parsed.error;
         }
         else if (!parsed.status.empty())
         {
             WSL_LOG("ImageImportProgress", TraceLoggingValue(parsed.status.c_str(), "Status"));
-            if (parsed.status->starts_with("sha256:"))
+            if (parsed.status.starts_with("sha256:"))
             {
                 THROW_HR_IF_MSG(E_UNEXPECTED, parsedImageId.has_value(), "Received duplicate image ID in import status");
-                parsedImageId = *parsed.status;
+                parsedImageId = parsed.status;
             }
         }
         else
@@ -1306,9 +1306,9 @@ try
         }
     };
 
-    auto onResponseComplete = [errorMessage] {
+    auto onResponseComplete = [&] {
         // Surface stream-reported errors (HTTP 200 followed by an error JSON line) after the transfer completes.
-        THROW_HR_WITH_USER_ERROR_IF(E_FAIL, errorMessage->value(), errorMessage->has_value());
+        THROW_HR_WITH_USER_ERROR_IF(E_FAIL, errorMessage.value(), errorMessage.has_value());
     };
 
     ImportImageImpl(*requestContext, std::move(onResponseChunk), std::move(onResponseComplete));
