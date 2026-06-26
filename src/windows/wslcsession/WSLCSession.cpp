@@ -1017,15 +1017,23 @@ try
 
     GUID stageId{};
     THROW_IF_FAILED(CoCreateGuid(&stageId));
-    const auto stagedDockerfile = std::format("/tmp/dockerfile-{}", wsl::shared::string::GuidToString<char>(stageId));
+    const auto stagingDirectory = std::format("{}/wslc-build-{}", c_engineStorage, wsl::shared::string::GuidToString<char>(stageId));
+    const auto buildTempDirectory = std::format("{}/tmp", stagingDirectory);
+    const auto stagingDockerfile = std::format("{}/Dockerfile", stagingDirectory);
 
     auto cleanupScratch = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
-        ServiceProcessLauncher rmLauncher("/bin/rm", {"/bin/rm", "-f", stagedDockerfile});
+        ServiceProcessLauncher rmLauncher("/bin/rm", {"/bin/rm", "-rf", stagingDirectory});
         rmLauncher.Launch(*m_virtualMachine).Wait();
     });
 
     {
-        const auto script = std::format("cat > '{}'", stagedDockerfile);
+        ServiceProcessLauncher mkdirLauncher("/bin/mkdir", {"/bin/mkdir", "-p", buildTempDirectory});
+        const auto code = mkdirLauncher.Launch(*m_virtualMachine).Wait();
+        THROW_HR_IF_MSG(E_FAIL, code != 0, "Failed to create build directory: %hs", mkdirLauncher.FormatResult(code).c_str());
+    }
+
+    {
+        const auto script = std::format("cat > '{}'", stagingDockerfile);
         ServiceProcessLauncher catLauncher("/bin/sh", {"/bin/sh", "--norc", "-c", script}, {}, WSLCProcessFlagsStdin);
         auto catProcess = catLauncher.Launch(*m_virtualMachine);
 
@@ -1037,12 +1045,13 @@ try
     }
 
     buildArgs.push_back("-f");
-    buildArgs.push_back(stagedDockerfile);
+    buildArgs.push_back(stagingDockerfile);
     buildArgs.push_back(mountPath);
 
     WSL_LOG("BuildImageStart", TraceLoggingValue(wsl::shared::string::Join(buildArgs, ' ').c_str(), "Command"));
 
-    ServiceProcessLauncher buildLauncher(buildArgs[0], buildArgs, {}, WSLCProcessFlagsNone);
+    // Use storage.vhd backed build temp folder to avoid out of space in /tmp
+    ServiceProcessLauncher buildLauncher(buildArgs[0], buildArgs, {std::format("TMPDIR={}", buildTempDirectory)}, WSLCProcessFlagsNone);
     auto buildProcess = buildLauncher.Launch(*m_virtualMachine);
 
     auto io = CreateIOContext();
