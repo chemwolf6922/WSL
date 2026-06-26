@@ -2,6 +2,8 @@
 
 #include <iostream>
 #include <filesystem>
+#include <chrono>
+#include <thread>
 #include <lxwil.h>
 #include "lxinitshared.h"
 #include "common.h"
@@ -305,6 +307,38 @@ void NetworkManager::InitializeLoopbackConfiguration(Interface& gelnic, wsl::sha
 
     InitializeLoopbackConfigurationImpl(gelnic, AF_INET);
     // InitializeLoopbackConfigurationImpl(gelnic, AF_INET6);
+
+    // TEST/EXPERIMENT (consomme IPv6 loopback port publishing): see
+    // Docs/experiments/consomme-ipv6-loopback.md. This whole block is throwaway and should be replaced
+    // by a proper mechanism (driven by a message/flag from Windows, gated on the consomme backend, and
+    // using a real "address is no longer tentative" wait instead of a fixed sleep).
+    //
+    // Consomme source-NATs host-originated IPv6 loopback connections to a virtual address in its
+    // advertised prefix: 2001:abcd::ff:fe00:NNNN:1 (allocated by local_addr_map.rs in openvmm). When a
+    // container replies (after netavark reverses its DNAT) the packet is destined to that virtual
+    // source, so loopback0 needs a route sending the whole 2001:abcd::ff:fe00:0:0/96 range back to
+    // consomme. Without it the reply has nowhere to go and the host connection to [::1]:<port> hangs.
+    {
+        // Crude barrier: give loopback0 time to obtain its 2001:abcd:: SLAAC address and finish DAD.
+        // Consomme learns the guest's routable IPv6 (the address it dials for DNAT) from that DAD
+        // Neighbor Solicitation, so this must happen before any container publishes a port.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        // Static neighbor entry so packets to the virtual range leave loopback0 with consomme's gateway
+        // MAC, exactly like the IPv4 loopback routes do.
+        GNS_LOG_INFO("[EXPERIMENT] Add static neighbor for IPv6 loopback gateway {}", c_ipv6LoopbackGateway.Addr().c_str());
+        Neighbor neighbor = Neighbor(c_ipv6LoopbackGateway, c_gatewayMacAddress, gelnic.Index());
+        neighborManager.ModifyNeighborEntry(neighbor, Operation::Create);
+
+        // Route consomme's virtual source range out loopback0 via the loopback gateway. Added to the
+        // main table so it is matched by IPv6's default "from all lookup main" rule (the loopback/local
+        // policy-routing tables are only wired up for IPv4 today).
+        const Address virtualRange = {AF_INET6, 96, "2001:abcd::ff:fe00:0:0"};
+        Route route = Route(AF_INET6, c_ipv6LoopbackGateway, gelnic.Index(), false, virtualRange, 0);
+        RoutingTable mainRoutingTable(RT_TABLE_MAIN);
+        GNS_LOG_INFO("[EXPERIMENT] Add route {} on loopback0 adapter {}", utils::Stringify(route).c_str(), gelnic.Name().c_str());
+        mainRoutingTable.ModifyRoute(route, Operation::Create);
+    }
 }
 
 /*
