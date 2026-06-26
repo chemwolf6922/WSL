@@ -1826,9 +1826,17 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         // In that networking mode, the host port always matches the vm port.
         auto hostPort = e.VmMapping.VmPort ? e.VmMapping.VmPort->Port() : e.VmMapping.HostPort();
 
-        // Use catch-all binding address based on the address family. :: binds all ipv6 interfaces, and 0:0:0:0 binds all ipv4 interfaces.
-        portEntry.emplace_back(common::docker_schema::PortMapping{
-            .HostIp = e.VmMapping.IsIPv6() ? "::" : "0.0.0.0", .HostPort = std::to_string(hostPort)});
+        // The runtime must publish each port where the host-side forwarding path will connect to it.
+        // The wslrelay (hvsocket) relay connects over VM loopback using VMPortMapping::ConnectFamily(),
+        // so publish on the matching loopback address -- PublishHostIp() applies the IPv6->IPv4 loopback
+        // workaround for container-published ::1 ports. The consomme/virtionet proxy instead reaches the
+        // port via a catch-all bind, so publish on the family wildcard (:: binds all IPv6 interfaces,
+        // 0.0.0.0 binds all IPv4 interfaces).
+        std::string hostIp = virtualMachine.UseWslRelayPortForwarding()
+                                 ? e.VmMapping.PublishHostIp()
+                                 : std::string{e.VmMapping.IsIPv6() ? "::" : "0.0.0.0"};
+
+        portEntry.emplace_back(common::docker_schema::PortMapping{.HostIp = std::move(hostIp), .HostPort = std::to_string(hostPort)});
     }
 
     auto labels = ParseKeyValuePairs(containerOptions.Labels, containerOptions.LabelsCount, WSLCContainerMetadataLabel);
