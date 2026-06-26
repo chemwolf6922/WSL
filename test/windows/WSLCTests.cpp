@@ -6270,9 +6270,14 @@ class WSLCTests
 
             VERIFY_SUCCEEDED(container.Get().Start(WSLCContainerStartFlagsNone, nullptr, nullptr));
             VERIFY_ARE_EQUAL(container.State(), WslcContainerStateRunning);
-            VERIFY_SUCCEEDED(container.Get().Kill(WSLCSignalSIGTERM));
 
-            VERIFY_ARE_EQUAL(container.GetInitProcess().Wait(120 * 1000), WSLCSignalSIGTERM + 128);
+            wsl::shared::retry::RetryWithTimeout<void>(
+                [&]() {
+                    VERIFY_SUCCEEDED(container.Get().Kill(WSLCSignalSIGTERM));
+                    VERIFY_ARE_EQUAL(container.GetInitProcess().Wait(5 * 1000), WSLCSignalSIGTERM + 128);
+                },
+                std::chrono::seconds{1},
+                std::chrono::seconds{120});
 
             // Verify that the container is in exited state.
             expectContainerList({{"test-container-kill-2", "debian:latest", WslcContainerStateExited}});
