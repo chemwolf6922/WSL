@@ -338,10 +338,8 @@ void ConsommeNetworking::SetupLoopbackDevice()
     createLoopbackDevice.type = hns::DeviceType::Loopback;
     createLoopbackDevice.lowerEdgeAdapterId = m_localhostAdapterId.value();
 
-    // TEST: Re-enable DAD on loopback0. The guest's DAD Neighbor Solicitation for its routable SLAAC address is how
-    // consomme learns the guest's global IPv6 (client_ip_ipv6_routable); the localhost relay then dials that
-    // forwardable global instead of the link-local address (which podman/netavark cannot forward to the container).
-    createLoopbackDevice.flags = hns::CreateDeviceFlags::None;
+    // ipv6 duplicate address detection (DAD) breaks the ipv6 localhost relay since we can't predict the address before the guest tells us about it.
+    createLoopbackDevice.flags = hns::CreateDeviceFlags::DisableDAD;
     constexpr auto loopbackType = GnsMessageType(createLoopbackDevice);
     m_gnsChannel.SendNetworkDeviceMessage(loopbackType, ToJsonW(createLoopbackDevice).c_str());
 }

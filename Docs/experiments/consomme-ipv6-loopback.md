@@ -49,12 +49,15 @@ Captured with `tcpdump` on loopback0. Two independent bugs, both rooted in
 consomme using link-local IPv6 where a *routable* address is required:
 
 1. **Destination (which guest address consomme dials).**
-   Consomme learns the guest's routable IPv6 from the **DAD Neighbor
-   Solicitation** the guest emits for its loopback0 SLAAC address. DAD was
-   **disabled** on loopback0, so consomme never learned the routable address and
-   fell back to dialing the guest's **link-local**. netavark's DNAT rules match
-   the routable published address, not the link-local one, so the SYN was never
-   forwarded to the container.
+   Consomme learns the guest's routable IPv6 two ways: from the **DAD Neighbor
+   Solicitation** for the loopback0 SLAAC address, *or* by **snooping any guest
+   packet sourced from a global address** on loopback0. DAD is **disabled**, and
+   enabling podman's own IPv6 suppresses the guest's organic global-sourced
+   traffic (`forwarding=1` + RFC 6724 source selection), so consomme learned
+   neither and fell back to dialing the guest's **link-local**. netavark's DNAT
+   rules match the routable published address, not the link-local one, so the SYN
+   was never forwarded to the container. (The fix re-triggers the snoop path
+   deterministically — see below.)
 
 2. **Source (which address consomme uses as the packet source).**
    Consomme source-NATs each host-side local address to a unique *virtual* address
@@ -74,17 +77,17 @@ the IPv4 case worked and masked the problem.)
 |---|---|
 | `vm/devices/net/net_consomme/consomme/src/local_addr_map.rs` | `get_or_allocate_v6` now allocates the virtual source from consomme's **routable** advertised prefix `2001:abcd::ff:fe00:NNNN:1` instead of link-local `fe80::ff:fe00:NNNN:1`. The IID `00ff:fe00:NNNN:0001` is deliberately distinct from EUI-64 (`…ff:fe…`) so it never collides with the guest's own SLAAC addresses. `test_allocate_v6` updated to expect `2001:abcd::00ff:fe00:1:1`. |
 
-> The destination half (half 1 above) is fixed purely on the WSL side by
-> re-enabling DAD — see below — because consomme already learns the routable
-> address from the DAD NS once DAD is on.
+> The destination half (half 1 above) is fixed purely on the WSL side — see
+> below. DAD is left **disabled**; instead the guest emits one global-sourced
+> packet on loopback0 so consomme learns the routable address by snooping it.
 
 ### WSL
 
 | File | Change |
 |---|---|
-| `src/windows/common/ConsommeNetworking.cpp` | `SetupLoopbackDevice()`: `createLoopbackDevice.flags = hns::CreateDeviceFlags::None;` (was `DisableDAD`). Re-enabling DAD lets consomme learn the guest's routable loopback0 IPv6 from the DAD Neighbor Solicitation. |
-| `src/linux/init/NetworkManager.cpp` | `InitializeLoopbackConfiguration()`: added the experiment block — (a) a 5 s wait for loopback0 SLAAC + DAD to settle, (b) a static neighbor entry for the IPv6 loopback gateway, and (c) a route `2001:abcd::ff:fe00:0:0/96 via fe80::500:4aef:feef:2aa2 dev loopback0` installed into the **main** table so it is matched by IPv6's default `from all lookup main` rule (the loopback/local policy-routing tables are IPv4-only today). Added `<chrono>`/`<thread>` includes. |
-| `src/windows/wslcsession/WSLCSession.cpp` | Removed the Windows-side `Sleep(5000)` from `StartPodmanSystemService()`; the wait now lives in loopback0 setup (the Linux side), tied to the actual SLAAC/DAD event rather than guessed at the Windows layer. |
+| `src/windows/common/ConsommeNetworking.cpp` | `SetupLoopbackDevice()`: left at `createLoopbackDevice.flags = hns::CreateDeviceFlags::DisableDAD;` (unchanged). Learning no longer relies on DAD — see the next row. |
+| `src/linux/init/NetworkManager.cpp` | `InitializeLoopbackConfiguration()`: added the experiment block — (a) **emit one UDP datagram from loopback0's global SLAAC address to global-scope multicast `ff0e::1`** (polling via `getifaddrs` until the address appears) so consomme snoops the source and learns the routable destination; (b) a static neighbor entry for the IPv6 loopback gateway; and (c) a route `2001:abcd::ff:fe00:0:0/96 via fe80::500:4aef:feef:2aa2 dev loopback0` installed into the **main** table so it is matched by IPv6's default `from all lookup main` rule (the loopback/local policy-routing tables are IPv4-only today). Added `<chrono>`/`<thread>`/socket includes. |
+| `src/windows/wslcsession/WSLCSession.cpp` | Removed the Windows-side `Sleep(5000)` from `StartPodmanSystemService()`; loopback0 setup now polls for the SLAAC address directly (the `getifaddrs` loop above) instead of a fixed Windows-side guess. |
 
 #### Why the `/96` route is needed
 
@@ -154,20 +157,22 @@ the IPv6 subnet.
 
 The experiment block in `InitializeLoopbackConfiguration` is intentionally crude:
 
-- **Fixed 5 s sleep** → replace with a real netlink wait for "loopback0 IPv6
-  address is no longer tentative" (DAD complete). Could also shorten DAD via
-  optimistic DAD or a smaller `RetransTimer`.
+- **`getifaddrs` poll + emitted packet** → works, but it's a side-channel hack
+  (consomme infers the destination from a stray multicast datagram we manufacture).
+  The robust design is for consomme to be *told* the routable address, or to learn
+  it from a deterministic guest signal, rather than us injecting snoopable traffic.
 - **Unconditional** → it runs for every loopback0 setup (mirrored *and* consomme)
-  and hardcodes the `2001:abcd::` prefix. Gate it on the consomme backend and/or
-  drive it from a message/flag sent by Windows, and source the prefix rather than
-  hardcoding it.
+  and hardcodes the `2001:abcd::ff:fe00:0:0/96` range. Gate it on the consomme
+  backend and/or drive it from a message/flag sent by Windows.
 - **`/96` in the main table** → fine as an experiment; revisit whether the IPv6
   loopback/local policy-routing tables (currently IPv4-only) should be wired up so
   this lives alongside the existing loopback routes.
 - **podman IPv6 subnet** → automate the `/etc/containers/networks/podman.json`
   change (or the network create) as part of WSLC container setup.
-- **`DisableDAD` flag** → re-enabling DAD globally on loopback0 may have other
-  effects; confirm it doesn't regress the mirrored-mode loopback scenarios.
+- **Learning depends on podman/source-selection quirks** → the emitted packet is
+  only needed because podman's `forwarding=1` + extra prefixes suppress the guest's
+  organic global-sourced traffic; if that behavior changes, the trigger may become
+  unnecessary or insufficient.
 
 ## Reference values
 
