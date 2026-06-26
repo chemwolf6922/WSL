@@ -95,6 +95,7 @@ struct VMPortMapping
     void Attach(WSLCVirtualMachine& Vm);
     void Detach();
     uint16_t HostPort() const;
+    void SetHostPort(uint16_t port);
 
     static VMPortMapping LocalhostTcpMapping(int Family, uint16_t WindowsPort);
     static VMPortMapping FromWSLCPortMapping(const ::WSLCPortMapping& Mapping);
@@ -133,7 +134,7 @@ public:
     // ICrashDumpCallback::OnCrashDump. The VM owns producing crash events; the session owns
     // fanning them out to any registered COM callbacks.
     using TOnCrashDump =
-        std::function<void(const std::wstring& DumpPath, const std::string& ProcessName, ULONGLONG Pid, ULONG Signal, ULONGLONG Timestamp)>;
+        std::function<void(const std::wstring& DumpPath, const std::string& ProcessName, ULONG Pid, ULONG Signal, ULONGLONG Timestamp)>;
 
     WSLCVirtualMachine(_In_ IWSLCVirtualMachine* Vm, _In_ const WSLCSessionInitSettings* Settings, _In_ HANDLE SessionTerminatingEvent, _In_ TOnCrashDump&& OnCrashDump);
     ~WSLCVirtualMachine();
@@ -190,6 +191,10 @@ public:
     }
 
     bool FeatureEnabled(WSLCFeatureFlags Flag) const;
+
+    WSLCNetworkingMode NetworkingMode() const;
+
+    bool UseWslRelayPortForwarding() const;
 
 private:
     void MapRelayPort(_In_ int ListenFamily, _In_ int ConnectFamily, _In_ unsigned short WindowsPort, _In_ unsigned short LinuxPort, _In_ bool Remove);

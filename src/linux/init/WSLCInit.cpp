@@ -765,6 +765,12 @@ void HandleMessageImpl(
     Transaction.SendResultMessage<uint32_t>(SocketAddress.svm_port);
     Channel.Close();
     UtilSetThreadName("PortRelay");
+
+    // If the host end of a relay socket is reset, a write will raise SIGPIPE. Ignore it so
+    // the failure surfaces as an EPIPE return value (handled by the relay loop) instead of
+    // terminating this forked PortRelay process and tearing down the vsock accept listener.
+    THROW_LAST_ERROR_IF(signal(SIGPIPE, SIG_IGN) == SIG_ERR);
+
     RunLocalHostRelay(SocketAddress, ListenSocket.get());
 }
 
@@ -992,6 +998,11 @@ int WSLCEntryPoint(int Argc, char* Argv[])
     }
 
     if (UtilMount(nullptr, "/sys/fs/cgroup", "cgroup2", 0, nullptr) < 0)
+    {
+        return -1;
+    }
+
+    if (UtilMount(nullptr, "/dev/shm", "tmpfs", MS_NOATIME | MS_NOSUID | MS_NODEV, nullptr) < 0)
     {
         return -1;
     }

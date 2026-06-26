@@ -40,6 +40,7 @@ constexpr auto c_engineReadyLogLine = "API service listening on";
 constexpr auto c_engineNetworkStorage = "/etc/containers/networks";
 constexpr auto c_engineNetworkStorageOverlayUpper = "/var/lib/containers/etc-containers-networks/upper";
 constexpr auto c_engineNetworkStorageOverlayWork = "/var/lib/containers/etc-containers-networks/work";
+constexpr auto c_storageVhdFilename = L"storage.vhdx";
 constexpr DWORD c_processTerminateTimeoutMs = 30 * 1000;
 constexpr DWORD c_processKillTimeoutMs = 10 * 1000;
 constexpr ULONG c_terminateStopContainerTimeoutSeconds = 10;
@@ -422,9 +423,6 @@ try
     // Configure storage.
     ConfigureStorage(*Settings, tokenInfo->User.Sid);
 
-    // Podman needs /dev/shm (tmpfs) for its shm-based lock manager.
-    m_virtualMachine->Mount("", "/dev/shm", "tmpfs", "rw,nosuid,nodev", 0);
-
     MountEngineNetworkStorageOverlay();
 
     // Mirror the host's trusted root CAs into the VM before dockerd starts.
@@ -480,13 +478,14 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
     {
         // If no storage path is specified, use a tmpfs for convenience.
         m_virtualMachine->Mount("", c_engineStorage, "tmpfs", "", 0);
+        m_storageMounted = true;
         return;
     }
 
     std::filesystem::path storagePath{Settings.StoragePath};
     THROW_HR_WITH_USER_ERROR_IF(E_INVALIDARG, Localization::MessagePathNotAbsolute(Settings.StoragePath), !storagePath.is_absolute());
 
-    m_storageVhdPath = storagePath / "storage.vhdx";
+    m_storageVhdPath = storagePath / c_storageVhdFilename;
 
     std::string diskDevice;
     std::optional<ULONG> diskLun{};
@@ -515,10 +514,30 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
             "Failed to attach vhd: %ls",
             m_storageVhdPath.c_str());
 
+        // No existing VHD — this is a new session. Reject if the caller forbade creation.
         THROW_HR_WITH_USER_ERROR_IF(
             HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND),
             Localization::MessageWslcSessionStorageNotFound(Settings.StoragePath),
             WI_IsFlagSet(Settings.StorageFlags, WSLCSessionStorageFlagsNoCreate));
+
+        // Reject any non-empty existing path so we don't mix user files with session storage.
+        // status's error_code distinguishes "doesn't exist yet" (OK, we'll create it) from other I/O errors.
+        std::error_code ec;
+        const auto status = std::filesystem::status(storagePath, ec);
+        if (ec && ec.value() != ERROR_FILE_NOT_FOUND && ec.value() != ERROR_PATH_NOT_FOUND)
+        {
+            THROW_IF_WIN32_ERROR_MSG(ec.value(), "status failed for %ls", storagePath.c_str());
+        }
+
+        if (std::filesystem::exists(status))
+        {
+            THROW_HR_WITH_USER_ERROR_IF(
+                E_INVALIDARG, Localization::MessageWslcSessionStorageMustBeDirectory(storagePath.c_str()), !std::filesystem::is_directory(status));
+
+            const bool empty = std::filesystem::is_empty(storagePath, ec);
+            THROW_IF_WIN32_ERROR_MSG(ec.value(), "is_empty failed for %ls", storagePath.c_str());
+            THROW_HR_WITH_USER_ERROR_IF(E_INVALIDARG, Localization::MessageWslcSessionStorageMustBeEmpty(storagePath.c_str()), !empty);
+        }
 
         // If the VHD wasn't found, create it.
         WSL_LOG("CreateStorageVhd", TraceLoggingValue(m_storageVhdPath.c_str(), "StorageVhdPath"));
@@ -536,6 +555,7 @@ void WSLCSession::ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID
 
     // Mount the device to /root.
     m_virtualMachine->Mount(diskDevice.c_str(), c_engineStorage, "ext4", "", 0);
+    m_storageMounted = true;
 
     // Configure swap on a separate ephemeral VHD.
     if (Settings.SwapSizeMb > 0)
@@ -889,6 +909,7 @@ try
     RETURN_HR_IF(E_INVALIDARG, *Options->ContextPath == L'\0');
     RETURN_HR_IF(E_INVALIDARG, Options->Tags.Count > 0 && Options->Tags.Values == nullptr);
     RETURN_HR_IF(E_INVALIDARG, Options->BuildArgs.Count > 0 && Options->BuildArgs.Values == nullptr);
+    RETURN_HR_IF(E_INVALIDARG, Options->Labels.Count > 0 && Options->Labels.Values == nullptr);
     THROW_HR_IF_MSG(
         E_INVALIDARG,
         WI_IsAnyFlagSet(static_cast<WSLCBuildImageFlags>(Options->Flags), ~WSLCBuildImageFlagsValid),
@@ -955,124 +976,73 @@ try
         buildArgs.push_back("--build-arg");
         buildArgs.push_back(Options->BuildArgs.Values[i]);
     }
-
-    // -----------------------------------------------------------------------
-    // Dockerfile staging
-    // -----------------------------------------------------------------------
-    //
-    // Goal: make the user-supplied Dockerfile available to `podman build` at a
-    // path that podman/buildah will accept.
-    //
-    // History — what did NOT work, and why:
-    //
-    //   1. `docker build -f - <ctx>` (the original approach for the docker
-    //      backend) — podman/buildah does NOT recognize `-f -` as a stdin
-    //      shorthand. It treats `-` as a literal path *relative to the build
-    //      context*, then stats `<ctx>/-` and fails with "no such file".
-    //
-    //   2. `podman build -f /dev/stdin <ctx>` — same outcome. Buildah resolves
-    //      *every* `-f` argument relative to the build context, even ones that
-    //      look absolute, so it ends up stat'ing `<ctx>/dev/stdin`. An
-    //      otherwise-valid absolute path is therefore rejected if it happens
-    //      to start with `/dev/`.
-    //
-    //   3. Spawning `sh -c 'cat > Containerfile'` inside the VM and piping the
-    //      bytes via stdin — the cat process hung forever waiting for EOF.
-    //      Closing the Windows-side write end of the pipe does NOT propagate
-    //      as EOF through the multi-layer wslc process-IO IPC chain (Win pipe
-    //      → m_ioRelay → hvsocket → in-VM IO → Linux pipe → process stdin)
-    //      under the ServiceProcessLauncher path. The helper never exits.
-    //
-    // What we do instead: write the Dockerfile to a Windows-side temp dir,
-    // mount that dir read-only into the VM via the same MountWindowsFolder
-    // machinery we already use for the build context, and point `podman build
-    // -f` at the Containerfile under that mount. Absolute paths that point
-    // OUTSIDE the build context (e.g. /mnt/wslc-build-<GUID>/Containerfile)
-    // ARE honored verbatim by buildah, so this resolves cleanly.
-    //
-    // Pros: no helper process, no stdin EOF propagation, no extra in-VM state
-    // to clean up. Cons: an extra 9P mount per build (~tens of ms) and a small
-    // amount of disk I/O on the host. Both are noise compared to the actual
-    // image build time.
-    GUID stageId{};
-    THROW_IF_FAILED(CoCreateGuid(&stageId));
-    const auto stageIdStr = wsl::shared::string::GuidToString<wchar_t>(stageId);
-    const std::filesystem::path stageDirHost = std::filesystem::temp_directory_path() / (L"wslc-build-" + stageIdStr);
-    const auto stagedDockerfileHost = stageDirHost / L"Containerfile";
-
-    // Make sure the host stage dir is removed on every exit path (success,
-    // throw, or cancellation). The Windows %TEMP% cleanup would eventually
-    // catch leaks, but doing it here keeps things tidy and bounded.
-    std::filesystem::create_directories(stageDirHost);
-    auto cleanupStageHost = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
-        std::error_code ec;
-        std::filesystem::remove_all(stageDirHost, ec);
-    });
-
-    // Stream the Dockerfile bytes from the user-supplied handle to the staged
-    // file. We do this synchronously on the wslcsession thread — Dockerfiles
-    // are tiny (KBs) and the IO is local, so there's no value in async here.
+    for (ULONG i = 0; i < Options->Labels.Count; i++)
     {
-        wil::unique_hfile out(
-            ::CreateFileW(stagedDockerfileHost.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-        THROW_LAST_ERROR_IF(!out.is_valid());
+        RETURN_HR_IF_NULL(E_INVALIDARG, Options->Labels.Values[i]);
+        RETURN_HR_IF(E_INVALIDARG, Options->Labels.Values[i][0] == '-');
+        buildArgs.push_back("--label");
+        buildArgs.push_back(Options->Labels.Values[i]);
+    }
 
-        char buf[64 * 1024];
-        while (true)
+    //
+    // `podman build -f -` does not work:
+    //   1. podman uses the /dev/stdin link but it's missing.
+    //   2. podman expects stdin to be a pipe but it's a socket.
+    // So we stage the Dockerfile to a real file in the VM and pass `-f <path>`.
+    //
+
+    std::vector<char> dockerfileContent;
+    while (true)
+    {
+        constexpr DWORD c_chunkSize = 64 * 1024;
+        const size_t offset = dockerfileContent.size();
+        dockerfileContent.resize(offset + c_chunkSize);
+
+        DWORD bytesRead = 0;
+        if (!::ReadFile(buildFileHandle.Get(), dockerfileContent.data() + offset, c_chunkSize, &bytesRead, nullptr))
         {
-            DWORD bytesRead = 0;
-            if (!::ReadFile(buildFileHandle.Get(), buf, sizeof(buf), &bytesRead, nullptr))
-            {
-                // An anonymous pipe (the common case for a piped Dockerfile) signals EOF by failing the
-                // read with ERROR_BROKEN_PIPE once the write end is closed and all buffered data has been
-                // consumed, rather than returning a zero-byte read. Treat that as a clean end of file.
-                const DWORD error = ::GetLastError();
-                if (error == ERROR_BROKEN_PIPE)
-                {
-                    break;
-                }
+            // A piped Dockerfile signals EOF by failing the read with ERROR_BROKEN_PIPE.
+            THROW_LAST_ERROR_IF(::GetLastError() != ERROR_BROKEN_PIPE);
+            dockerfileContent.resize(offset);
+            break;
+        }
 
-                THROW_WIN32(error);
-            }
-
-            if (bytesRead == 0)
-            {
-                break; // EOF on user handle — Dockerfile fully copied.
-            }
-
-            DWORD bytesWritten = 0;
-            THROW_LAST_ERROR_IF(!::WriteFile(out.get(), buf, bytesRead, &bytesWritten, nullptr));
-            THROW_HR_IF_MSG(E_FAIL, bytesWritten != bytesRead, "Short write staging Dockerfile (wrote %lu of %lu bytes)", bytesWritten, bytesRead);
+        dockerfileContent.resize(offset + bytesRead);
+        if (bytesRead == 0)
+        {
+            // EOF on a regular handle.
+            break;
         }
     }
 
-    // Expose the staged Dockerfile to the VM via a separate 9P mount. We use
-    // a different GUID-based path so it never collides with the build-context
-    // mount and so podman/buildah see the file at an absolute path that lies
-    // outside the context (a requirement, as explained above).
-    const auto stageMountPath = std::format("/mnt/wslc-build-{}", wsl::shared::string::GuidToString<char>(stageId));
-    THROW_IF_FAILED(m_virtualMachine->MountWindowsFolder(stageDirHost.c_str(), stageMountPath.c_str(), TRUE));
-    auto unmountStage =
-        wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() { m_virtualMachine->UnmountWindowsFolder(stageMountPath.c_str()); });
+    GUID stageId{};
+    THROW_IF_FAILED(CoCreateGuid(&stageId));
+    const auto stagedDockerfile = std::format("/tmp/dockerfile-{}", wsl::shared::string::GuidToString<char>(stageId));
 
-    const auto stagedDockerfile = std::format("{}/Containerfile", stageMountPath);
+    auto cleanupScratch = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
+        ServiceProcessLauncher rmLauncher("/bin/rm", {"/bin/rm", "-f", stagedDockerfile});
+        rmLauncher.Launch(*m_virtualMachine).Wait();
+    });
 
-    // Final podman invocation: `-f <staged absolute path> <context mount>`. No
-    // stdin pipe — the build process doesn't need WSLCProcessFlagsStdin.
+    {
+        const auto script = std::format("cat > '{}'", stagedDockerfile);
+        ServiceProcessLauncher catLauncher("/bin/sh", {"/bin/sh", "--norc", "-c", script}, {}, WSLCProcessFlagsStdin);
+        auto catProcess = catLauncher.Launch(*m_virtualMachine);
+
+        std::vector<std::unique_ptr<OverlappedIOHandle>> extraHandles;
+        extraHandles.emplace_back(std::make_unique<WriteHandle>(catProcess.GetStdHandle(WSLCFDStdin), std::move(dockerfileContent)));
+
+        const auto result = catProcess.WaitAndCaptureOutput(60000UL, std::move(extraHandles));
+        THROW_HR_IF_MSG(E_FAIL, result.Code != 0, "Failed to stage Dockerfile: %hs", catLauncher.FormatResult(result).c_str());
+    }
+
     buildArgs.push_back("-f");
     buildArgs.push_back(stagedDockerfile);
     buildArgs.push_back(mountPath);
 
     WSL_LOG("BuildImageStart", TraceLoggingValue(wsl::shared::string::Join(buildArgs, ' ').c_str(), "Command"));
 
-    const auto buildTmpDir = std::format("{}/tmp", c_engineStorage);
-    {
-        ServiceProcessLauncher mkdirLauncher("/bin/mkdir", {"/bin/mkdir", "-p", buildTmpDir});
-        const int mkdirExit = mkdirLauncher.Launch(*m_virtualMachine).Wait();
-        THROW_HR_IF_MSG(E_FAIL, mkdirExit != 0, "Failed to create build temp dir %hs (exit %i)", buildTmpDir.c_str(), mkdirExit);
-    }
-
-    ServiceProcessLauncher buildLauncher(buildArgs[0], buildArgs, {std::format("TMPDIR={}", buildTmpDir)}, WSLCProcessFlagsNone);
+    ServiceProcessLauncher buildLauncher(buildArgs[0], buildArgs, {}, WSLCProcessFlagsNone);
     auto buildProcess = buildLauncher.Launch(*m_virtualMachine);
 
     auto io = CreateIOContext();
@@ -1197,48 +1167,64 @@ try
 }
 CATCH_RETURN();
 
-HRESULT WSLCSession::ImportImage(const WSLCHandle ImageHandle, LPCSTR ImageName, IProgressCallback* ProgressCallback, ULONGLONG ContentSize, IWarningCallback* WarningCallback)
+HRESULT WSLCSession::ImportImage(
+    const WSLCHandle ImageHandle, LPCSTR ImageName, IProgressCallback* ProgressCallback, ULONGLONG ContentSize, IWarningCallback* WarningCallback, LPSTR* ImageId)
 try
 {
     UNREFERENCED_PARAMETER(ProgressCallback);
 
     WSLCExecutionContext context(this, WarningCallback);
 
-    RETURN_HR_IF_NULL(E_POINTER, ImageName);
-    RETURN_HR_IF(E_INVALIDARG, strlen(ImageName) > WSLC_MAX_IMAGE_NAME_LENGTH);
+    RETURN_HR_IF_NULL(E_POINTER, ImageId);
+    *ImageId = nullptr;
 
-    auto [repo, tagOrDigest] = wslutil::ParseImage(ImageName);
+    std::string repo;
+    std::string tag;
 
-    THROW_HR_IF_MSG(E_INVALIDARG, !tagOrDigest.has_value(), "Expected tag for image import: %hs", ImageName);
+    if (ImageName != nullptr)
+    {
+        RETURN_HR_IF(E_INVALIDARG, strlen(ImageName) > WSLC_MAX_IMAGE_NAME_LENGTH);
+
+        auto [parsedRepo, tagOrDigest] = wslutil::ParseImage(ImageName);
+        THROW_HR_IF_MSG(E_INVALIDARG, !tagOrDigest.has_value(), "Expected tag for image import: %hs", ImageName);
+        repo = parsedRepo;
+        tag = tagOrDigest.value();
+    }
 
     auto lock = m_lock.lock_shared();
 
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_dockerClient.has_value());
 
     auto userHandle = OpenUserHandle(ImageHandle);
-    auto requestContext = m_dockerClient->ImportImage(repo, tagOrDigest.value(), ContentSize, userHandle.Get());
+    auto requestContext = m_dockerClient->ImportImage(repo, tag, ContentSize, userHandle.Get());
 
-    auto errorMessage = std::make_shared<std::optional<std::string>>();
+    std::optional<std::string> errorMessage{std::nullopt};
+    std::optional<std::string> parsedImageId{std::nullopt};
 
-    auto onResponseChunk = [errorMessage](const gsl::span<char>& buffer) {
+    auto onResponseChunk = [&](const gsl::span<char>& buffer) {
         auto parsed = shared::FromJson<docker_schema::CreateImageProgress>(std::string(buffer.begin(), buffer.end()).c_str());
 
         if (parsed.error.has_value())
         {
-            if (errorMessage->has_value())
+            if (errorMessage.has_value())
             {
                 LOG_HR_MSG(
                     E_UNEXPECTED,
                     "Overriding previous error message '%hs' with new message '%hs'",
-                    (*errorMessage)->c_str(),
+                    errorMessage->c_str(),
                     parsed.error->c_str());
             }
 
-            *errorMessage = std::move(parsed.error);
+            errorMessage = parsed.error;
         }
         else if (!parsed.status.empty())
         {
             WSL_LOG("ImageImportProgress", TraceLoggingValue(parsed.status.c_str(), "Status"));
+            if (parsed.status.starts_with("sha256:"))
+            {
+                THROW_HR_IF_MSG(E_UNEXPECTED, parsedImageId.has_value(), "Received duplicate image ID in import status");
+                parsedImageId = parsed.status;
+            }
         }
         else
         {
@@ -1246,14 +1232,26 @@ try
         }
     };
 
-    auto onResponseComplete = [errorMessage] {
+    auto onResponseComplete = [&] {
         // Surface stream-reported errors (HTTP 200 followed by an error JSON line) after the transfer completes.
-        THROW_HR_WITH_USER_ERROR_IF(E_FAIL, errorMessage->value(), errorMessage->has_value());
+        THROW_HR_WITH_USER_ERROR_IF(E_FAIL, errorMessage.value(), errorMessage.has_value());
     };
 
     ImportImageImpl(*requestContext, std::move(onResponseChunk), std::move(onResponseComplete));
 
-    OnImageCreated(ImageName);
+    THROW_HR_IF_MSG(E_UNEXPECTED, !parsedImageId.has_value(), "Import succeeded but did not return an image ID");
+
+    if (ImageName != nullptr && strlen(ImageName) > 0)
+    {
+        OnImageCreated(ImageName);
+    }
+    else
+    {
+        OnImageCreated(parsedImageId->c_str());
+    }
+
+    *ImageId = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(parsedImageId->c_str()).release();
+
     return S_OK;
 }
 CATCH_RETURN();
@@ -1394,6 +1392,7 @@ void WSLCSession::SaveImageImpl(std::pair<uint32_t, wil::unique_socket>& SocketC
     {
         // Save failed, parse the error message.
         auto error = wsl::shared::FromJson<docker_schema::ErrorResponse>(errorJson.c_str());
+        THROW_HR_WITH_USER_ERROR_IF(WSLC_E_IMAGE_NOT_FOUND, error.message, SocketCodePair.first == 404);
         THROW_HR_WITH_USER_ERROR(E_FAIL, error.message.c_str());
     }
 }
@@ -2973,11 +2972,16 @@ try
                 WSL_LOG("PodmanSystemServiceExit", TraceLoggingValue(podmanExitCode, "code"));
             }
 
-            try
+            // N.B. dockerd has exited by this point, so unmounting the VHD is safe since no container can be running.
+            if (m_storageMounted)
             {
-                m_virtualMachine->Unmount(c_engineStorage);
+                try
+                {
+                    m_virtualMachine->Unmount(c_engineStorage);
+                    m_storageMounted = false;
+                }
+                CATCH_LOG();
             }
-            CATCH_LOG();
         }
     }
 
@@ -3031,7 +3035,7 @@ void WSLCSession::RemoveCrashDumpCallback(CrashDumpCallbackList::iterator It) no
     m_crashDumpCallbacks.erase(It);
 }
 
-void WSLCSession::OnCrashDumpWritten(const std::wstring& DumpPath, const std::string& ProcessName, ULONGLONG Pid, ULONG Signal, ULONGLONG Timestamp)
+void WSLCSession::OnCrashDumpWritten(const std::wstring& DumpPath, const std::string& ProcessName, ULONG Pid, ULONG Signal, ULONGLONG Timestamp)
 try
 {
     // Snapshot the callback list under the lock so that cross-process callback invocations don't
@@ -3106,7 +3110,7 @@ try
     {
         // No existing port allocation, create a new one.
         auto allocated = std::make_pair(m_virtualMachine->TryAllocatePort(LinuxPort, Family, IPPROTO_TCP), static_cast<size_t>(0));
-        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), allocated.first == nullptr);
+        THROW_HR_IF(HRESULT_FROM_WIN32(WSAEADDRINUSE), allocated.first == nullptr);
 
         it = m_allocatedPorts.emplace(LinuxPort, allocated).first;
         inserted = true;
@@ -3183,13 +3187,18 @@ HRESULT WSLCSession::LoadImage(WSLCCompatHandle ImageHandle, IWSLCCompatProgress
 }
 
 HRESULT WSLCSession::ImportImage(
-    WSLCCompatHandle ImageHandle, LPCSTR ImageName, IWSLCCompatProgressCallback* ProgressCallback, ULONGLONG ContentLength, IWSLCCompatWarningCallback* WarningCallback)
+    WSLCCompatHandle ImageHandle,
+    LPCSTR ImageName,
+    IWSLCCompatProgressCallback* ProgressCallback,
+    ULONGLONG ContentLength,
+    IWSLCCompatWarningCallback* WarningCallback,
+    LPSTR* ImageId)
 {
     const auto handle = apicompat::Convert(ImageHandle);
     const auto progress = apicompat::Convert(ProgressCallback);
     const auto warning = apicompat::Convert(WarningCallback);
 
-    return ImportImage(handle, ImageName, progress.Get(), ContentLength, warning.Get());
+    return ImportImage(handle, ImageName, progress.Get(), ContentLength, warning.Get(), ImageId);
 }
 
 HRESULT WSLCSession::ListImages(const WSLCCompatListImagesOptions* Options, WSLCCompatImageInformation** Images, ULONG* Count)

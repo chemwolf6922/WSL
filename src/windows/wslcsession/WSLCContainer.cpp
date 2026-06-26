@@ -364,7 +364,7 @@ std::vector<ContainerPortMapping> BuildPortMappings(std::vector<_WSLCPortMapping
     const bool allocateVmPorts = NetworkModeAllocatesVmPorts(primary);
     for (auto& e : requestedPorts)
     {
-        if (e.HostPort == WSLC_EPHEMERAL_PORT)
+        if (e.HostPort == WSLC_EPHEMERAL_PORT && vm.NetworkingMode() == WSLCNetworkingModeNAT)
         {
             e.HostPort = AllocateEphemeralPort(e.Family, e.BindingAddress);
         }
@@ -1412,14 +1412,13 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
     wslcInspect.Config.User = dockerInspect.Config.User;
     wslcInspect.Config.WorkingDir = dockerInspect.Config.WorkingDir;
 
-    // Map WSLC port mappings (Windows host ports only). HostIp is not set here and will use
-    // the default value ("127.0.0.1") defined in the InspectPortBinding schema.
+    // Map WSLC port mappings (Windows host ports only).
     for (const auto& e : m_mappedPorts)
     {
-        // TODO: ipv6 support.
         auto portKey = std::format("{}/{}", e.ContainerPort, e.ProtocolString());
 
         wslc_schema::InspectPortBinding portBinding{};
+        portBinding.HostIp = e.VmMapping.BindingAddressString();
         portBinding.HostPort = std::to_string(e.VmMapping.HostPort());
 
         wslcInspect.Ports[portKey].push_back(std::move(portBinding));
@@ -1788,7 +1787,17 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         // In that networking mode, the host port always matches the vm port.
         auto hostPort = e.VmMapping.VmPort ? e.VmMapping.VmPort->Port() : e.VmMapping.HostPort();
 
-        portEntry.emplace_back(common::docker_schema::PortMapping{.HostIp = e.VmMapping.PublishHostIp(), .HostPort = std::to_string(hostPort)});
+        // The runtime must publish each port where the host-side forwarding path will connect to it.
+        // The wslrelay (hvsocket) relay connects over VM loopback using VMPortMapping::ConnectFamily(),
+        // so publish on the matching loopback address -- PublishHostIp() applies the IPv6->IPv4 loopback
+        // workaround for container-published ::1 ports. The consomme/virtionet proxy instead reaches the
+        // port via a catch-all bind, so publish on the family wildcard (:: binds all IPv6 interfaces,
+        // 0.0.0.0 binds all IPv4 interfaces).
+        std::string hostIp = virtualMachine.UseWslRelayPortForwarding()
+                                 ? e.VmMapping.PublishHostIp()
+                                 : std::string{e.VmMapping.IsIPv6() ? "::" : "0.0.0.0"};
+
+        portEntry.emplace_back(common::docker_schema::PortMapping{.HostIp = std::move(hostIp), .HostPort = std::to_string(hostPort)});
     }
 
     auto labels = ParseKeyValuePairs(containerOptions.Labels, containerOptions.LabelsCount, WSLCContainerMetadataLabel);
@@ -2192,9 +2201,7 @@ void WSLCContainerImpl::MapPorts()
                     m_virtualMachine.TryAllocatePort(e.ContainerPort, e.VmMapping.BindAddress.si_family, e.VmMapping.Protocol);
 
                 THROW_HR_WITH_USER_ERROR_IF(
-                    HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS),
-                    wsl::shared::Localization::MessageWslcPortInUse(FormatPortEndpoint(e), m_id),
-                    !allocatedPort);
+                    HRESULT_FROM_WIN32(WSAEADDRINUSE), wsl::shared::Localization::MessageWslcPortInUse(FormatPortEndpoint(e), m_id), !allocatedPort);
 
                 e.VmMapping.AssignVmPort(allocatedPort);
 
@@ -2212,7 +2219,7 @@ void WSLCContainerImpl::MapPorts()
             if (result == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) || result == HRESULT_FROM_WIN32(WSAEADDRINUSE))
             {
                 THROW_HR_WITH_USER_ERROR(
-                    HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wsl::shared::Localization::MessageWslcPortInUse(FormatPortEndpoint(e), m_id));
+                    HRESULT_FROM_WIN32(WSAEADDRINUSE), wsl::shared::Localization::MessageWslcPortInUse(FormatPortEndpoint(e), m_id));
             }
             throw;
         }
