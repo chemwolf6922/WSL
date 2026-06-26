@@ -1032,10 +1032,6 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
     // N.B. If the signal was SIGTERM for instance, we'll receive the stop notification via OnEvent().
     bool waitForStop = !Kill || (SignalArg.value_or(WSLCSignalSIGKILL) == WSLCSignalSIGKILL);
 
-    // True when we delivered an explicit stop-signal override through the /kill endpoint
-    // instead of /stop (see below). Drives the SIGKILL fallback and error handling.
-    bool signalDelivered = false;
-
     try
     {
         if (Kill)
@@ -1047,65 +1043,30 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
                 return;
             }
         }
-        else if (SignalArg.has_value())
-        {
-            // podman's compat /containers/{id}/stop endpoint ignores the "signal" query
-            // parameter (dockerd has honored it since API v1.42) and always stops the
-            // container with its configured StopSignal. To honor an explicit stop-signal
-            // override we deliver the signal ourselves via the /kill endpoint, then fall
-            // back to SIGKILL after the timeout below if the container is still running.
-            // N.B. Set the flag BEFORE the call so the catch recognizes the /kill path even
-            // when SignalContainer throws (e.g. 409 Conflict when the container already stopped).
-            signalDelivered = true;
-            m_dockerClient.SignalContainer(m_id, SignalArg);
-        }
         else
         {
-            m_dockerClient.StopContainer(m_id, std::nullopt, TimeoutArg);
+            // podman's /stop honors ?signal= (a system-distro patch until it's upstream) and blocks
+            // until exit, escalating to SIGKILL after the timeout -- forward both and let podman own it.
+            m_dockerClient.StopContainer(m_id, SignalArg, TimeoutArg);
         }
     }
     catch (const DockerHTTPException& e)
     {
-        // The container is already in the desired (stopped) state when /stop returns 304 Not
-        // Modified, or when the /kill override returns 409 Conflict (podman's KillContainer maps
-        // ErrCtrStopped / ErrCtrStateInvalid to 409). Stop() is idempotent, so neither is a
-        // failure. This matters for a short-lived container that exits on its own between our
-        // state check and the HTTP call (m_state still Running, but podman already stopped it).
-        // Kill() keeps its original strict behavior.
-        const bool alreadyStopped = !Kill && (signalDelivered ? e.StatusCode() == 409 : e.StatusCode() == 304);
+        // 304 = already stopped (e.g. a short-lived container that exited between our state check
+        // and this call); Stop() is idempotent. Kill() keeps its strict behavior.
+        const bool alreadyStopped = !Kill && e.StatusCode() == 304;
         if (!alreadyStopped)
         {
             THROW_DOCKER_USER_ERROR_MSG(e, "Failed to %hs container '%hs'", Kill ? "kill" : "stop", m_id.c_str());
         }
     }
 
-    // Wait for the stop event to get the Docker timestamp. We must not call OnStopped() until the
-    // container has actually stopped: /kill is asynchronous (it only delivers the signal), unlike
-    // /stop which blocks until the container exits. TimeoutSeconds is the GRACEFUL window before
-    // escalating to SIGKILL for a non-SIGKILL override; it must not shorten the wait for the actual
-    // stop in the SIGKILL or normal-stop cases (TimeoutSeconds can legitimately be 0 = "kill now").
+    // The container has already exited (/stop blocks until it does); wait for the async stop event
+    // from OnEvent() to read its precise Docker timestamp.
     std::optional<std::uint64_t> stopTimestamp;
-    const bool gracefulOverride = signalDelivered && SignalArg.value_or(WSLCSignalSIGKILL) != WSLCSignalSIGKILL;
-    const auto firstWait = (gracefulOverride && TimeoutSeconds >= 0) ? std::chrono::seconds(TimeoutSeconds) : 60s;
-    if (m_wslcSession.WaitForEventOrSessionTerminating(m_stopNotification.Event.get(), firstWait))
+    if (m_wslcSession.WaitForEventOrSessionTerminating(m_stopNotification.Event.get(), 60s))
     {
         stopTimestamp = m_stopNotification.EventTime.load(std::memory_order_acquire);
-    }
-    else if (gracefulOverride)
-    {
-        // The override signal didn't stop the container within its graceful window. Escalate to
-        // SIGKILL to honor Stop()'s "force-kill after timeout" contract (podman's /stop would do
-        // this internally, but we bypassed it to deliver the override signal via /kill).
-        try
-        {
-            m_dockerClient.SignalContainer(m_id, WSLCSignalSIGKILL);
-        }
-        CATCH_LOG();
-
-        if (m_wslcSession.WaitForEventOrSessionTerminating(m_stopNotification.Event.get(), 60s))
-        {
-            stopTimestamp = m_stopNotification.EventTime.load(std::memory_order_acquire);
-        }
     }
 
     comWrapper = OnStopped(stopTimestamp);
