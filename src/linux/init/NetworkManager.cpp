@@ -17,6 +17,7 @@
 #include "conncheckshared.h"
 #include "RuntimeErrorWithSourceLocation.h"
 #include "stringshared.h"
+#include "retryshared.h"
 
 // Custom table used for storing routes for loopback IPs.
 constexpr int c_loopbackRoutingTableId = 127;
@@ -312,39 +313,18 @@ void NetworkManager::InitializeLoopbackConfiguration(Interface& gelnic, wsl::sha
     InitializeLoopbackConfigurationImpl(gelnic, AF_INET);
     // InitializeLoopbackConfigurationImpl(gelnic, AF_INET6);
 
-    // TEST/EXPERIMENT (consomme IPv6 loopback port publishing): see
-    // Docs/experiments/consomme-ipv6-loopback.md. Throwaway; replace with a proper mechanism (driven by
-    // a message/flag from Windows and gated on the consomme backend) once validated.
-    //
-    // Two things are needed for a host connection to [::1]:<port> to reach a podman container:
-    //
-    //  1. Consomme must dial loopback0's *global* address (2001:abcd::211:...), not its link-local one,
-    //     since netavark can only DNAT the forwardable global. Consomme learns that address by snooping
-    //     any guest packet sourced from it. With DAD disabled - and especially with podman's own IPv6
-    //     enabled, which suppresses the guest's organic global-sourced traffic - consomme never sees
-    //     one, so we emit one ourselves: a UDP datagram from loopback0's global address to a global-
-    //     scope multicast group. (This replaces re-enabling DAD as the learning trigger.)
-    //
-    //  2. Consomme source-NATs the connection to a virtual address in 2001:abcd::ff:fe00:NNNN:1
-    //     (local_addr_map.rs in openvmm). The container's reply is destined there, so loopback0 needs a
-    //     route sending 2001:abcd::ff:fe00:0:0/96 back to consomme (added below).
     {
-        // (1) Teach consomme the guest's routable IPv6.
+        // Emit a packet so consomme can learn loopback0's global ipv6 address.
         EmitConsommeIpv6LearningPacket(gelnic);
 
-        // (2) Static neighbor so packets to the virtual range leave loopback0 with consomme's gateway
-        // MAC, exactly like the IPv4 loopback routes do.
-        GNS_LOG_INFO("[EXPERIMENT] Add static neighbor for IPv6 loopback gateway {}", c_ipv6LoopbackGateway.Addr().c_str());
+        // Static neighbor so packets to the virtual range leave loopback0 with consomme's gateway MAC.
         Neighbor neighbor = Neighbor(c_ipv6LoopbackGateway, c_gatewayMacAddress, gelnic.Index());
         neighborManager.ModifyNeighborEntry(neighbor, Operation::Create);
 
-        // Route consomme's virtual source range out loopback0 via the loopback gateway. Added to the
-        // main table so it is matched by IPv6's default "from all lookup main" rule (the loopback/local
-        // policy-routing tables are only wired up for IPv4 today).
+        // Route consomme's virtual source range out loopback0 via the loopback gateway.
         const Address virtualRange = {AF_INET6, 96, "2001:abcd::ff:fe00:0:0"};
         Route route = Route(AF_INET6, c_ipv6LoopbackGateway, gelnic.Index(), false, virtualRange, 0);
         RoutingTable mainRoutingTable(RT_TABLE_MAIN);
-        GNS_LOG_INFO("[EXPERIMENT] Add route {} on loopback0 adapter {}", utils::Stringify(route).c_str(), gelnic.Name().c_str());
         mainRoutingTable.ModifyRoute(route, Operation::Create);
     }
 }
@@ -589,25 +569,17 @@ wsl::shared::conncheck::ConnCheckResult NetworkManager::SendConnectRequest(const
     return wsl::shared::conncheck::CheckConnection(remoteAddress, nullptr, "80");
 }
 
-// TEST/EXPERIMENT (consomme IPv6 loopback port publishing): emit one datagram from loopback0's global
-// SLAAC address so consomme snoops the source and learns the guest's routable IPv6
-// (client_ip_ipv6_routable) - the address its localhost relay must dial for inbound connections. See
-// Docs/experiments/consomme-ipv6-loopback.md.
-//
-// Best-effort: on any failure it logs and returns (consomme then falls back to the link-local address
-// and the connection won't work, but loopback setup must not abort).
 void NetworkManager::EmitConsommeIpv6LearningPacket(const Interface& gelnic)
+try
 {
     const std::string ifName = gelnic.Name();
 
-    // Find loopback0's global (non-link-local) IPv6 address, polling until SLAAC assigns it.
-    sockaddr_in6 globalSrc{};
-    bool haveGlobal = false;
-    for (int attempt = 0; attempt < 10 && !haveGlobal; ++attempt)
-    {
-        ifaddrs* list = nullptr;
-        if (getifaddrs(&list) == 0)
-        {
+    // Find loopback0's global (non-link-local) IPv6 address, retrying until SLAAC assigns it.
+    sockaddr_in6 globalSrc = wsl::shared::retry::RetryWithTimeout<sockaddr_in6>(
+        [&ifName]() {
+            ifaddrs* list = nullptr;
+            THROW_LAST_ERROR_IF(getifaddrs(&list) != 0);
+            auto freeList = wil::scope_exit([&] { freeifaddrs(list); });
             for (ifaddrs* ifa = list; ifa != nullptr; ifa = ifa->ifa_next)
             {
                 if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET6 || ifName != ifa->ifa_name)
@@ -619,58 +591,36 @@ void NetworkManager::EmitConsommeIpv6LearningPacket(const Interface& gelnic)
                 {
                     continue;
                 }
-                globalSrc = *sa;
-                haveGlobal = true;
-                break;
+                return *sa;
             }
-            freeifaddrs(list);
-        }
-
-        if (!haveGlobal)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-
-    if (!haveGlobal)
-    {
-        GNS_LOG_ERROR("[EXPERIMENT] loopback0 global IPv6 address not found; consomme cannot learn the routable destination");
-        return;
-    }
+            throw RuntimeErrorWithSourceLocation("loopback0 has no global IPv6 address yet");
+        },
+        std::chrono::milliseconds(100),
+        std::chrono::seconds(1));
 
     char addrStr[INET6_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET6, &globalSrc.sin6_addr, addrStr, sizeof(addrStr));
-    GNS_LOG_INFO("[EXPERIMENT] Emitting learning packet from loopback0 global address {}", addrStr);
+    THROW_LAST_ERROR_IF(inet_ntop(AF_INET6, &globalSrc.sin6_addr, addrStr, sizeof(addrStr)) == nullptr);
+    GNS_LOG_INFO("Emitting learning packet from loopback0 global address {}", addrStr);
 
     wil::unique_fd sock{socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
-    if (!sock)
-    {
-        GNS_LOG_ERROR("[EXPERIMENT] failed to create learning socket, errno {}", errno);
-        return;
-    }
+    THROW_LAST_ERROR_IF(!sock);
 
     // Egress on loopback0 so consomme (the only peer on that link) snoops the packet.
     int ifIndex = gelnic.Index();
-    setsockopt(sock.get(), IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifIndex, sizeof(ifIndex));
+    THROW_LAST_ERROR_IF(setsockopt(sock.get(), IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifIndex, sizeof(ifIndex)) != 0);
 
     // Bind the global address as the source (also confirms it is assigned and usable).
     globalSrc.sin6_port = 0;
-    if (bind(sock.get(), reinterpret_cast<sockaddr*>(&globalSrc), sizeof(globalSrc)) != 0)
-    {
-        GNS_LOG_ERROR("[EXPERIMENT] bind to loopback0 global address failed, errno {}", errno);
-        return;
-    }
+    THROW_LAST_ERROR_IF(bind(sock.get(), reinterpret_cast<sockaddr*>(&globalSrc), sizeof(globalSrc)) != 0);
 
     // Global-scope multicast: needs no unicast route (2001:abcd:: is off-link) yet still leaves with the
     // global source.
     sockaddr_in6 dst{};
     dst.sin6_family = AF_INET6;
     dst.sin6_port = htons(9); // discard
-    inet_pton(AF_INET6, "ff0e::1", &dst.sin6_addr);
+    THROW_HR_IF(E_UNEXPECTED, inet_pton(AF_INET6, "ff0e::1", &dst.sin6_addr) != 1);
 
     const char payload = 0;
-    if (sendto(sock.get(), &payload, sizeof(payload), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0)
-    {
-        GNS_LOG_ERROR("[EXPERIMENT] learning sendto failed, errno {}", errno);
-    }
+    THROW_LAST_ERROR_IF(sendto(sock.get(), &payload, sizeof(payload), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0);
 }
+CATCH_LOG()

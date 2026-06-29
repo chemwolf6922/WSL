@@ -82,10 +82,6 @@ public:
 private:
     void InitializeLoopbackConfigurationImpl(Interface& gelnic, int addressFamily);
 
-    // TEST/EXPERIMENT (consomme IPv6 loopback port publishing): emit a learning packet from loopback0's
-    // global address so consomme learns the guest's routable IPv6.
-    void EmitConsommeIpv6LearningPacket(const Interface& gelnic);
-
     RoutingTable& routingTable;
     // Custom routing tables used for loopback mirroring. Not to be confused with the Linux "local" table
     RoutingTable loopbackRoutingTable;
@@ -95,4 +91,6 @@ private:
     IpNeighborManager neighborManager;
 
     void ModifyNetSetting(int addressFamily, const char* settingName, const char* scope, const char* settingValue, size_t settingValueLen);
+
+    void EmitConsommeIpv6LearningPacket(const Interface& gelnic);
 };

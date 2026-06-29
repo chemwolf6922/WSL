@@ -1793,9 +1793,8 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         // workaround for container-published ::1 ports. The consomme/virtionet proxy instead reaches the
         // port via a catch-all bind, so publish on the family wildcard (:: binds all IPv6 interfaces,
         // 0.0.0.0 binds all IPv4 interfaces).
-        std::string hostIp = virtualMachine.UseWslRelayPortForwarding()
-                                 ? e.VmMapping.PublishHostIp()
-                                 : std::string{e.VmMapping.IsIPv6() ? "::" : "0.0.0.0"};
+        std::string hostIp = virtualMachine.UseWslRelayPortForwarding() ? e.VmMapping.PublishHostIp()
+                                                                        : std::string{e.VmMapping.IsIPv6() ? "::" : "0.0.0.0"};
 
         portEntry.emplace_back(common::docker_schema::PortMapping{.HostIp = std::move(hostIp), .HostPort = std::to_string(hostPort)});
     }
