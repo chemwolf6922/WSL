@@ -95,7 +95,7 @@ class WSLCE2EContainerCreateTests
 
         std::wstringstream expectedError;
         expectedError << L"Image '" << reference << L"' not found, pulling\r\n"
-                      << L"manifest for " << reference << L" not found: manifest unknown: manifest unknown\r\n"
+                      << L"{\"message\":\"manifest unknown: manifest unknown\"}\r\n\r\n"
                       << L"Error code: WSLC_E_IMAGE_NOT_FOUND\r\n";
         result.Verify({.Stderr = expectedError.str(), .ExitCode = 1});
     }
@@ -152,11 +152,15 @@ class WSLCE2EContainerCreateTests
         result.Verify({.Stderr = L"", .ExitCode = 0});
         auto containerId = result.GetStdoutOneLine();
 
-        // Attempt to create another container with the same name
+        // Attempt to create another container with the same name. Container
+        // engines word "name conflict" differently; check the behavioral
+        // contract: failure + container name + ERROR_ALREADY_EXISTS HRESULT.
         result = RunWslc(std::format(L"container create --name {} {}", WslcContainerName, DebianImage.NameAndTag()));
-        result.Verify(
-            {.Stderr = std::format(L"Conflict. The container name \"/{}\" is already in use by container \"{}\". You have to remove (or rename) that container to be able to reuse that name.\r\nError code: ERROR_ALREADY_EXISTS\r\n", WslcContainerName, containerId),
-             .ExitCode = 1});
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        auto stderrText = result.Stderr.value_or(L"");
+        VERIFY_IS_TRUE(stderrText.find(L"already in use") != std::wstring::npos);
+        VERIFY_IS_TRUE(stderrText.find(WslcContainerName) != std::wstring::npos);
+        VERIFY_IS_TRUE(stderrText.find(L"ERROR_ALREADY_EXISTS") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Create_Volume_WriteFromHostReadFromContainer)
@@ -566,8 +570,15 @@ class WSLCE2EContainerCreateTests
         result.Verify({.Stderr = L"", .ExitCode = 0});
 
         result = RunWslc(std::format(L"container start -a {}", WslcContainerName));
-        result.Verify(
-            {.Stderr = L"unable to find user user_does_not_exist: no matching entries in passwd file\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        // docker: "unable to find user X: no matching entries in passwd file"
+        // podman: same core message wrapped as "preparing container <id> for
+        // attach: <docker message>". Match the engine-agnostic core so the
+        // contract (start must fail with a clear user-not-found message) holds
+        // across both engines.
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        VERIFY_IS_TRUE(result.Stderr.has_value());
+        VERIFY_IS_TRUE(result.Stderr->find(L"unable to find user user_does_not_exist") != std::wstring::npos);
+        VERIFY_IS_TRUE(result.Stderr->find(L"no matching entries in passwd file") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Create_Tmpfs)
@@ -613,14 +624,22 @@ class WSLCE2EContainerCreateTests
     {
         auto result =
             RunWslc(std::format(L"container create --name {} --tmpfs wslc-tmpfs {}", WslcContainerName, DebianImage.NameAndTag()));
-        result.Verify({.Stderr = L"invalid mount path: 'wslc-tmpfs' mount path must be absolute\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        auto stderrText = result.Stderr.value_or(L"");
+        VERIFY_IS_TRUE(stderrText.find(L"wslc-tmpfs") != std::wstring::npos);
+        VERIFY_IS_TRUE(stderrText.find(L"absolute") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Create_Tmpfs_EmptyDestination_Fails)
     {
         auto result =
             RunWslc(std::format(L"container create --name {} --tmpfs :size=64k {}", WslcContainerName, DebianImage.NameAndTag()));
-        result.Verify({.Stderr = L"invalid mount path: '' mount path must be absolute\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        // docker: "invalid mount path: '' mount path must be absolute"
+        // podman: "fill out specgen: container directory cannot be empty"
+        // Verify failure + some "empty"/"directory" indicator.
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        auto stderrText = result.Stderr.value_or(L"");
+        VERIFY_IS_TRUE(stderrText.find(L"empty") != std::wstring::npos || stderrText.find(L"absolute") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Create_WorkDir)
@@ -666,14 +685,21 @@ class WSLCE2EContainerCreateTests
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Create_DNS)
     {
+        // See Run_DNS for the rationale. Same controlled-DNS-sibling approach,
+        // but exercising the create+start path instead of run --rm.
+        constexpr auto kMockDnsName = L"wslc-test-mock-dns";
+        constexpr auto kProbeDomain = L"probe.wslc.test";
+        constexpr auto kProbeAnswer = L"10.99.99.99";
+
+        auto mockIp = StartMockDnsServer(AlpineImage, kMockDnsName, kProbeDomain, kProbeAnswer);
+        auto cleanup = wil::scope_exit([&]() { EnsureContainerDoesNotExist(kMockDnsName); });
+
         auto result = RunWslc(std::format(
-            L"container create --name {} --dns 1.1.1.1 --dns 8.8.8.8 {} cat /etc/resolv.conf", WslcContainerName, DebianImage.NameAndTag()));
+            L"container create --name {} --dns {} {} getent hosts {}", WslcContainerName, mockIp, AlpineImage.NameAndTag(), kProbeDomain));
         result.Verify({.Stderr = L"", .ExitCode = 0});
 
         result = RunWslc(std::format(L"container start -a {}", WslcContainerName));
-        result.Verify({.Stderr = L"", .ExitCode = 0});
-        VERIFY_IS_TRUE(result.Stdout->find(L"nameserver 1.1.1.1") != std::wstring::npos);
-        VERIFY_IS_TRUE(result.Stdout->find(L"nameserver 8.8.8.8") != std::wstring::npos);
+        VERIFY_IS_TRUE(result.Stdout.has_value() && result.Stdout->find(kProbeAnswer) != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Create_DNSSearch)
@@ -813,6 +839,8 @@ class WSLCE2EContainerCreateTests
             L"container create --name {} --network {} {} true", WslcContainerName, TestNetworkName, DebianImage.NameAndTag()));
         result.Verify({.Stderr = L"", .ExitCode = 0});
 
+        auto cleanupContainer = wil::scope_exit([&] { EnsureContainerDoesNotExist(WslcContainerName); });
+
         const auto inspect = InspectContainer(WslcContainerName);
         VERIFY_ARE_EQUAL(wsl::shared::string::WideToMultiByte(TestNetworkName), inspect.HostConfig.NetworkMode);
     }
@@ -841,6 +869,8 @@ class WSLCE2EContainerCreateTests
         result = RunWslc(std::format(
             L"container create --name {} --network {} --network-alias db {} true", WslcContainerName, TestNetworkName, DebianImage.NameAndTag()));
         result.Verify({.Stderr = L"", .ExitCode = 0});
+
+        auto cleanupContainer = wil::scope_exit([&] { EnsureContainerDoesNotExist(WslcContainerName); });
 
         const auto inspect = InspectContainer(WslcContainerName);
         const auto networkName = wsl::shared::string::WideToMultiByte(TestNetworkName);

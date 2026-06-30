@@ -91,4 +91,6 @@ private:
     IpNeighborManager neighborManager;
 
     void ModifyNetSetting(int addressFamily, const char* settingName, const char* scope, const char* settingValue, size_t settingValueLen);
+
+    void EmitConsommeIpv6LearningPacket(const Interface& gelnic);
 };

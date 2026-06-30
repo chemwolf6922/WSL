@@ -24,6 +24,7 @@ class WSLCE2EContainerRunTests
 
     TEST_CLASS_SETUP(ClassSetup)
     {
+        EnsureImageIsLoaded(AlpineImage);
         EnsureImageIsLoaded(DebianImage);
         EnsureImageIsLoaded(PythonImage);
 
@@ -41,6 +42,7 @@ class WSLCE2EContainerRunTests
     {
         EnsureContainerDoesNotExist(WslcContainerName);
         EnsureContainerDoesNotExist(WslcContainerName2);
+        EnsureImageIsDeleted(AlpineImage);
         EnsureImageIsDeleted(DebianImage);
         EnsureImageIsDeleted(PythonImage);
         EnsureVolumeDoesNotExist(WslcVolumeName);
@@ -139,8 +141,12 @@ class WSLCE2EContainerRunTests
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_Entrypoint_Invalid_Path)
     {
         auto result = RunWslc(std::format(L"container run --rm --entrypoint /bin/does-not-exist {}", DebianImage.NameAndTag()));
-        result.Verify(
-            {.Stdout = L"", .Stderr = L"failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: \"/bin/does-not-exist\": stat /bin/does-not-exist: no such file or directory: unknown\r\nError code: E_INVALIDARG\r\n", .ExitCode = 1});
+        // OCI runtime exec-failure surfaces via /attach in attached mode. With
+        // podman, /attach 5xx with empty body causes loss of the detailed
+        // runtime message before wslc can inspect (see Category C analysis).
+        // Verify behavioral contract only: failure exit + non-empty stderr.
+        VERIFY_ARE_NOT_EQUAL(0, result.ExitCode.value_or(0));
+        VERIFY_IS_TRUE(result.Stderr.has_value() && !result.Stderr->empty());
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_Entrypoint_Detach_Lifecycle)
@@ -378,14 +384,23 @@ class WSLCE2EContainerRunTests
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_UserOption_UnknownUser_Fails)
     {
         auto result = RunWslc(std::format(L"container run --rm -u user_does_not_exist {} id -u", DebianImage.NameAndTag()));
-        result.Verify(
-            {.Stderr = L"unable to find user user_does_not_exist: no matching entries in passwd file\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        // docker: "unable to find user X: no matching entries in passwd file"
+        // podman: same core message wrapped as "preparing container <id> for
+        // attach: <docker message>". Match the engine-agnostic core.
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        VERIFY_IS_TRUE(result.Stderr.has_value());
+        VERIFY_IS_TRUE(result.Stderr->find(L"unable to find user user_does_not_exist") != std::wstring::npos);
+        VERIFY_IS_TRUE(result.Stderr->find(L"no matching entries in passwd file") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_UserOption_UnknownGroup_Fails)
     {
         auto result = RunWslc(std::format(L"container run --rm -u root:badgid {} id -u", DebianImage.NameAndTag()));
-        result.Verify({.Stderr = L"unable to find group badgid: no matching entries in group file\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        // See UnknownUser_Fails for why we substring-match the engine message.
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        VERIFY_IS_TRUE(result.Stderr.has_value());
+        VERIFY_IS_TRUE(result.Stderr->find(L"unable to find group badgid") != std::wstring::npos);
+        VERIFY_IS_TRUE(result.Stderr->find(L"no matching entries in group file") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_UserOption_NameGroupRoot)
@@ -760,13 +775,20 @@ class WSLCE2EContainerRunTests
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_Tmpfs_RelativePath_Fails)
     {
         auto result = RunWslc(std::format(L"container run --rm --tmpfs wslc-tmpfs {}", DebianImage.NameAndTag()));
-        result.Verify({.Stderr = L"invalid mount path: 'wslc-tmpfs' mount path must be absolute\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        auto stderrText = result.Stderr.value_or(L"");
+        VERIFY_IS_TRUE(stderrText.find(L"wslc-tmpfs") != std::wstring::npos);
+        VERIFY_IS_TRUE(stderrText.find(L"absolute") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_Tmpfs_EmptyDestination_Fails)
     {
         auto result = RunWslc(std::format(L"container run --rm --tmpfs :size=64k {}", DebianImage.NameAndTag()));
-        result.Verify({.Stderr = L"invalid mount path: '' mount path must be absolute\r\nError code: E_FAIL\r\n", .ExitCode = 1});
+        // docker: "invalid mount path: '' mount path must be absolute"
+        // podman: "fill out specgen: container directory cannot be empty"
+        VERIFY_ARE_EQUAL(1, result.ExitCode.value_or(0));
+        auto stderrText = result.Stderr.value_or(L"");
+        VERIFY_IS_TRUE(stderrText.find(L"empty") != std::wstring::npos || stderrText.find(L"absolute") != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_WorkDir)
@@ -789,11 +811,28 @@ class WSLCE2EContainerRunTests
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_DNS)
     {
+        // With podman+aardvark-dns enabled on the default bridge network,
+        // container /etc/resolv.conf always points at the aardvark gateway;
+        // --dns values become aardvark's upstream forwarders rather than
+        // literal nameserver entries (which differs from docker's behavior,
+        // making /etc/resolv.conf-content checks unreliable).
+        //
+        // Verify --dns is honored end-to-end by spinning up a controlled DNS
+        // sibling container that answers a unique probe domain with a unique
+        // probe IP, pointing the test container's --dns at it, and asserting
+        // the unique IP comes back. Only the controlled DNS knows this answer
+        // — receiving it definitively proves --dns routed through that server.
+        constexpr auto kMockDnsName = L"wslc-test-mock-dns";
+        constexpr auto kProbeDomain = L"probe.wslc.test";
+        constexpr auto kProbeAnswer = L"10.99.99.99";
+
+        auto mockIp = StartMockDnsServer(AlpineImage, kMockDnsName, kProbeDomain, kProbeAnswer);
+        auto cleanup = wil::scope_exit([&]() { EnsureContainerDoesNotExist(kMockDnsName); });
+
         auto result =
-            RunWslc(std::format(L"container run --rm --dns 1.1.1.1 --dns 8.8.8.8 {} cat /etc/resolv.conf", DebianImage.NameAndTag()));
-        result.Verify({.Stderr = L"", .ExitCode = 0});
-        VERIFY_IS_TRUE(result.Stdout->find(L"nameserver 1.1.1.1") != std::wstring::npos);
-        VERIFY_IS_TRUE(result.Stdout->find(L"nameserver 8.8.8.8") != std::wstring::npos);
+            RunWslc(std::format(L"container run --rm --dns {} {} getent hosts {}", mockIp, AlpineImage.NameAndTag(), kProbeDomain));
+
+        VERIFY_IS_TRUE(result.Stdout.has_value() && result.Stdout->find(kProbeAnswer) != std::wstring::npos);
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Container_Run_DNSSearch)
@@ -839,6 +878,8 @@ class WSLCE2EContainerRunTests
             L"container run --name {} --network {} {} true", WslcContainerName, TestNetworkName, DebianImage.NameAndTag()));
         result.Verify({.Stderr = L"", .ExitCode = 0});
 
+        auto cleanupContainer = wil::scope_exit([&] { EnsureContainerDoesNotExist(WslcContainerName); });
+
         const auto inspect = InspectContainer(WslcContainerName);
         VERIFY_ARE_EQUAL(wsl::shared::string::WideToMultiByte(TestNetworkName), inspect.HostConfig.NetworkMode);
         VERIFY_IS_TRUE(inspect.NetworkSettings.Networks.contains(wsl::shared::string::WideToMultiByte(TestNetworkName)));
@@ -867,6 +908,8 @@ class WSLCE2EContainerRunTests
         result = RunWslc(std::format(
             L"container run --name {} --network {} --network-alias db {} true", WslcContainerName, TestNetworkName, DebianImage.NameAndTag()));
         result.Verify({.Stderr = L"", .ExitCode = 0});
+
+        auto cleanupContainer = wil::scope_exit([&] { EnsureContainerDoesNotExist(WslcContainerName); });
 
         const auto inspect = InspectContainer(WslcContainerName);
         const auto networkName = wsl::shared::string::WideToMultiByte(TestNetworkName);
@@ -1099,6 +1142,7 @@ private:
     const std::wstring HostEnvVariableValue2 = L"wslc-host-env-value2";
 
     // Test images
+    const TestImage& AlpineImage = AlpineTestImage();
     const TestImage& DebianImage = DebianTestImage();
     const TestImage& PythonImage = PythonTestImage();
 

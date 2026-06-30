@@ -117,6 +117,11 @@ std::string DockerHTTPClient::URL::Escape(const std::string& Value)
 DockerHTTPClient::DockerHTTPClient(wsl::shared::SocketChannel&& Channel, HANDLE exitingEvent, GUID VmId, ULONG ConnectTimeoutMs) :
     m_exitingEvent(exitingEvent), m_channel(std::move(Channel)), m_vmId(VmId), m_connectTimeoutMs(ConnectTimeoutMs)
 {
+    // m_channel was forked from the init channel in WSLCSession::Initialize and copied its exit
+    // events, including the session terminating event. That event is signaled at the start of
+    // WSLCSession::Terminate(), so leaving it would abort the teardown's StopContainer() and corrupt
+    // the engine storage. Abort only on the VM event.
+    m_channel.SetExitEvents({m_exitingEvent});
 }
 
 std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::PullImage(
@@ -143,20 +148,20 @@ std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::PullImag
     return SendRequestImpl(verb::post, url, {}, customHeaders);
 }
 
-std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::LoadImage(uint64_t ContentLength)
+std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::LoadImage(uint64_t ContentLength, HANDLE BodySource)
 {
-    return SendRequestImpl(
-        verb::post, URL::Create("/images/load"), {}, {{"Content-Type", "application/x-tar"}, {"Content-Length", std::to_string(ContentLength)}});
+    return SendStreamRequest(verb::post, URL::Create("/images/load"), ContentLength, "application/x-tar", BodySource);
 }
 
-std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::ImportImage(const std::string& Repo, const std::string& Tag, uint64_t ContentLength)
+std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::ImportImage(
+    const std::string& Repo, const std::string& Tag, uint64_t ContentLength, HANDLE BodySource)
 {
     auto url = URL::Create("/images/create");
     url.SetParameter("tag", Tag);
     url.SetParameter("repo", Repo);
     url.SetParameter("fromSrc", "-");
 
-    return SendRequestImpl(verb::post, url, {}, {{"Content-Type", "application/x-tar"}, {"Content-Length", std::to_string(ContentLength)}});
+    return SendStreamRequest(verb::post, url, ContentLength, "application/x-tar", BodySource);
 }
 
 void DockerHTTPClient::TagImage(const std::string& Id, const std::string& Repo, const std::string& Tag)
@@ -386,7 +391,45 @@ wil::unique_socket DockerHTTPClient::AttachContainer(const std::string& Id, cons
 
     if (response.result_int() != 101)
     {
-        throw DockerHTTPException(std::move(response), verb::post, url.Get(), "", "");
+        // SendRequest only consumed the response headers; for a non-101 the
+        // engine has written an error body that's still in the socket. Drain
+        // it so DockerHTTPException carries the engine's actual message
+        // (e.g. "unable to find user X: no matching entries in passwd file"
+        // when /attach fails because of --user resolution). Without this,
+        // the exception's body is empty and HasErrorMessage / DockerMessage
+        // surface a misleading "Invalid JSON: empty input".
+        std::string body;
+        auto contentLengthIt = response.find(boost::beast::http::field::content_length);
+        if (contentLengthIt != response.end())
+        {
+            size_t expectedLen = 0;
+            try
+            {
+                expectedLen = std::stoull(std::string{contentLengthIt->value()});
+            }
+            CATCH_LOG_MSG("Failed to parse Content-Length for /attach error body");
+
+            if (expectedLen > 0)
+            {
+                constexpr size_t maxBody = 64 * 1024;
+                expectedLen = std::min(expectedLen, maxBody);
+                body.resize(expectedLen);
+                size_t totalRead = 0;
+                while (totalRead < expectedLen)
+                {
+                    auto bytesRead = common::socket::Receive(
+                        socket.get(), gsl::span(reinterpret_cast<gsl::byte*>(body.data() + totalRead), expectedLen - totalRead), m_exitingEvent);
+                    if (bytesRead == 0)
+                    {
+                        break;
+                    }
+                    totalRead += bytesRead;
+                }
+                body.resize(totalRead);
+            }
+        }
+
+        throw DockerHTTPException(std::move(response), verb::post, url.Get(), "", std::move(body));
     }
 
     return std::move(socket);
@@ -586,7 +629,7 @@ wil::unique_socket DockerHTTPClient::ConnectSocket()
 
     // Connect that socket to the docker unix socket.
     shared::MessageWriter<WSLC_UNIX_CONNECT> writer;
-    writer.WriteString(writer->PathOffset, "/var/run/docker.sock");
+    writer.WriteString(writer->PathOffset, "/run/podman/podman.sock");
 
     auto result = newChannel.Transaction<WSLC_UNIX_CONNECT>(writer.Span());
     THROW_HR_IF_MSG(E_FAIL, result.Result < 0, "Failed to connect to unix socket: '/var/run/docker.sock', %i", result.Result);
@@ -787,6 +830,82 @@ std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::SendRequ
 #endif
 
     return std::move(context);
+}
+
+std::unique_ptr<DockerHTTPClient::HTTPRequestContext> DockerHTTPClient::SendStreamRequest(
+    verb Method, const URL& Url, uint64_t ContentLength, std::string_view ContentType, HANDLE BodySource)
+{
+    auto context = std::make_unique<DockerHTTPClient::HTTPRequestContext>(ConnectSocket());
+
+    // Use buffer_body so beast manages Content-Length consistently while we
+    // stream the payload in chunks. The previous approach (string_body with
+    // empty body + manual Content-Length header, then raw writes to the socket)
+    // was racy with the response reader and could be torn down mid-upload.
+    http::request<http::buffer_body> req{Method, Url.Get(), 11};
+    req.set(http::field::host, "localhost");
+    req.set(http::field::connection, "close");
+    req.set(http::field::accept, "application/json");
+    req.set(http::field::content_type, std::string{ContentType});
+    req.set(http::field::content_length, std::to_string(ContentLength));
+
+    http::request_serializer<http::buffer_body> sr{req};
+    boost::beast::error_code ec;
+
+    // 1) Write headers.
+    http::write_header(context->stream, sr, ec);
+    THROW_HR_IF_MSG(E_FAIL, ec.failed(), "Failed to write HTTP headers to '%hs': %hs", Url.Get().c_str(), ec.message().c_str());
+
+    // 2) Stream the body in chunks. Each iteration: read from BodySource, hand the
+    //    buffer to beast, then call http::write. Beast returns `need_buffer` when it
+    //    has consumed the current chunk and the message isn't done yet — we treat
+    //    that as the signal to refill.
+    constexpr size_t bufSize = 64 * 1024;
+    auto buf = std::make_unique<char[]>(bufSize);
+    uint64_t totalSent = 0;
+
+    while (totalSent < ContentLength)
+    {
+        const auto toRead = static_cast<DWORD>(std::min<uint64_t>(bufSize, ContentLength - totalSent));
+
+        DWORD bytesRead = 0;
+        if (!ReadFile(BodySource, buf.get(), toRead, &bytesRead, nullptr))
+        {
+            const auto readError = GetLastError();
+            // A body source that closes before ContentLength bytes (e.g. ERROR_BROKEN_PIPE on a
+            // closed pipe) is a truncated upload; surface it as a generic failure rather than
+            // leaking the raw pipe error code to the caller.
+            THROW_HR_IF_MSG(E_FAIL, readError == ERROR_BROKEN_PIPE, "Body source closed before %llu of %llu bytes were read", totalSent, ContentLength);
+            THROW_WIN32(readError);
+        }
+        THROW_HR_IF_MSG(E_FAIL, bytesRead == 0, "Premature EOF on body source at %llu of %llu bytes", totalSent, ContentLength);
+
+        totalSent += bytesRead;
+        const bool lastChunk = (totalSent >= ContentLength);
+
+        req.body().data = buf.get();
+        req.body().size = bytesRead;
+        req.body().more = !lastChunk;
+
+        ec = {};
+        http::write(context->stream, sr, ec);
+
+        if (ec == http::error::need_buffer)
+        {
+            // Expected when more=true: serializer consumed our chunk and wants the next one.
+            ec = {};
+        }
+
+        THROW_HR_IF_MSG(
+            E_FAIL,
+            ec.failed(),
+            "Failed to write body to '%hs' at %llu of %llu bytes: %hs",
+            Url.Get().c_str(),
+            totalSent,
+            ContentLength,
+            ec.message().c_str());
+    }
+
+    return context;
 }
 
 std::pair<DockerHTTPClient::HTTPResponse, wil::unique_socket> DockerHTTPClient::SendRequest(

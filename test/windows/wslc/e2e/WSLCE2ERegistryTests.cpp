@@ -32,7 +32,7 @@ namespace {
     {
         VERIFY_ARE_EQUAL(1u, result.ExitCode.value_or(0));
         VERIFY_IS_TRUE(result.Stderr.has_value());
-        VERIFY_IS_TRUE(result.Stderr->find(L"no basic auth credentials") != std::wstring::npos);
+        VERIFY_IS_TRUE(result.Stderr->find(L"authentication required") != std::wstring::npos);
     }
 
     void VerifyLogoutSucceeds(const std::wstring& registryAddress)

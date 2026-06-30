@@ -68,7 +68,7 @@ public:
     ~DockerEventTracker();
 
     EventTrackingReference RegisterContainerStateUpdates(const std::string& ContainerId, ContainerStateChangeCallback&& Callback) noexcept;
-    EventTrackingReference RegisterExecStateUpdates(const std::string& ContainerId, const std::string& ExecId, ContainerStateChangeCallback&& Callback) noexcept;
+    EventTrackingReference RegisterExecStateUpdates(const std::string& ContainerId, ContainerStateChangeCallback&& Callback) noexcept;
     EventTrackingReference RegisterVolumeUpdates(VolumeEventCallback&& Callback) noexcept;
     void UnregisterCallback(size_t Id) noexcept;
 
@@ -83,7 +83,6 @@ private:
     {
         size_t CallbackId;
         std::string ContainerId;
-        std::optional<std::string> ExecId;
         ContainerStateChangeCallback Callback;
     };
 
@@ -102,5 +101,10 @@ private:
     WSLCSession& m_session;
     std::recursive_mutex m_lock;
     std::atomic<size_t> m_callbackId{0};
+
+    // Accumulates raw bytes from the /events stream. Events are newline-delimited JSON and a single
+    // event can span multiple HTTP chunks, so chunk data is buffered here and split on newlines.
+    // Only touched on the (single-threaded) IORelay callback thread, so it needs no lock.
+    std::string m_eventBuffer;
 };
 } // namespace wsl::windows::service::wslc

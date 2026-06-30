@@ -61,7 +61,10 @@ class WSLCE2EImageTagTests
     WSLC_TEST_METHOD(WSLCE2E_Image_Tag_SourceImageNotFound)
     {
         auto result = RunWslc(std::format(L"image tag {} {}", InvalidImage.NameAndTag(), DebianTaggedImage.NameAndTag()));
-        auto errorMessage = std::format(L"No such image: {}\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n", InvalidImage.NameAndTag());
+        auto errorMessage = std::format(
+            L"failed to find image {}: {}: image not known\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n",
+            InvalidImage.NameAndTag(),
+            InvalidImage.NameAndTag());
         result.Verify({.Stdout = L"", .Stderr = errorMessage, .ExitCode = 1});
     }
 

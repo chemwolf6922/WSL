@@ -125,6 +125,49 @@ WSLCVolumeInformation WSLCVolumes::CreateVolume(
     return info;
 }
 
+bool WSLCVolumes::EnsureVolumeExists(const std::string& Name)
+{
+    if (Name.empty())
+    {
+        return false;
+    }
+
+    auto lock = m_lock.lock_exclusive();
+
+    if (m_volumes.contains(Name))
+    {
+        return false;
+    }
+
+    // Match docker's auto-create-on-container-create semantics: guest driver,
+    // no driver opts, no labels. See header comment for the podman /events
+    // timing rationale.
+    auto volume = WSLCGuestVolumeImpl::Create(Name.c_str(), {}, {}, m_dockerClient);
+
+    auto [it, inserted] = m_volumes.insert({volume->Name(), std::move(volume)});
+    WI_VERIFY(inserted);
+
+    m_expectedEvents.emplace_back(Name, VolumeEvent::Create);
+
+    return true;
+}
+
+void WSLCVolumes::TrackExistingVolume(const std::string& Name)
+{
+    if (Name.empty())
+    {
+        return;
+    }
+
+    auto lock = m_lock.lock_exclusive();
+
+    // OpenVolumeExclusiveLockHeld is a no-op when the volume is already tracked,
+    // and inspects + adopts it from the backend otherwise. It does not enqueue
+    // an expected create event, which is correct here: the volume already exists
+    // and OnVolumeEvent will not see a matching create.
+    OpenVolumeExclusiveLockHeld(Name);
+}
+
 void WSLCVolumes::DeleteVolume(LPCSTR Name)
 {
     THROW_HR_IF(E_POINTER, Name == nullptr);
@@ -216,6 +259,11 @@ WSLCVolumes::PruneVolumesResult WSLCVolumes::PruneVolumes(const std::map<std::st
 {
     auto lock = m_lock.lock_exclusive();
 
+    // Forward filters (including docker's "all") unchanged. The system distro's
+    // podman is patched to give the compat /volumes/prune docker-compatible
+    // semantics: "all=true" prunes every unused volume, while no filter prunes
+    // only anonymous volumes (named volumes are preserved). See
+    // config/podman-volume-prune-anonymous.patch in the wslg image.
     auto dockerResult = m_dockerClient.PruneVolumes(Filters);
 
     PruneVolumesResult result{};

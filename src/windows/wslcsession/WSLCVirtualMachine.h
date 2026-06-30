@@ -89,6 +89,9 @@ struct VMPortMapping
     bool IsLocalhost() const;
     bool IsIPv6() const;
     std::string BindingAddressString() const;
+    int ConnectFamily() const;
+    std::string PublishHostIp() const;
+
     void Attach(WSLCVirtualMachine& Vm);
     void Detach();
     uint16_t HostPort() const;
@@ -106,6 +109,11 @@ private:
     static SOCKADDR_INET ParseBindingAddress(int Family, uint16_t Port, const char* Address);
 
     WSLCVirtualMachine* Vm{};
+
+    // True when this mapping is a container port published through the container runtime
+    // (podman/netavark), which uses an OUTPUT-chain loopback DNAT. Such IPv6-loopback ports
+    // require the IPv4-loopback workaround applied by ConnectFamily()/PublishHostIp().
+    bool m_containerPublished{};
 };
 
 class WSLCVirtualMachine
@@ -186,10 +194,10 @@ public:
 
     WSLCNetworkingMode NetworkingMode() const;
 
-private:
-    void MapRelayPort(_In_ int Family, _In_ unsigned short WindowsPort, _In_ unsigned short LinuxPort, _In_ bool Remove);
-
     bool UseWslRelayPortForwarding() const;
+
+private:
+    void MapRelayPort(_In_ int ListenFamily, _In_ int ConnectFamily, _In_ unsigned short WindowsPort, _In_ unsigned short LinuxPort, _In_ bool Remove);
 
     // Initial setup during Connect()
     void ConfigureNetworking();

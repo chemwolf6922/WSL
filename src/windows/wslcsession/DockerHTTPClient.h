@@ -64,11 +64,16 @@ public:
         return wsl::shared::FromJson<T>(m_responseBody.c_str());
     }
 
-    // Only try to decode the error message if it's actually json.
+    // Only try to decode the error message if it's actually json AND the body
+    // is non-empty. Some podman 5xx paths return Content-Type: application/json
+    // with no body (or a streaming-style response whose body the caller did
+    // not drain). Without this empty-body check, DockerMessage() would call
+    // FromJson("") and surface a confusing "Invalid JSON: empty input" error
+    // instead of letting the catch fall through to e.what().
     bool HasErrorMessage() const
     {
         auto it = m_response.find(boost::beast::http::field::content_type);
-        return it != m_response.end() && it->value().starts_with("application/json");
+        return it != m_response.end() && it->value().starts_with("application/json") && !m_responseBody.empty();
     }
 
     uint16_t StatusCode() const noexcept
@@ -157,8 +162,8 @@ public:
     // Image management.
     std::unique_ptr<HTTPRequestContext> PullImage(
         const std::string& Repo, const std::optional<std::string>& tagOrDigest, const std::optional<std::string>& registryAuth = std::nullopt);
-    std::unique_ptr<HTTPRequestContext> ImportImage(const std::string& Repo, const std::string& Tag, uint64_t ContentLength);
-    std::unique_ptr<HTTPRequestContext> LoadImage(uint64_t ContentLength);
+    std::unique_ptr<HTTPRequestContext> ImportImage(const std::string& Repo, const std::string& Tag, uint64_t ContentLength, HANDLE BodySource);
+    std::unique_ptr<HTTPRequestContext> LoadImage(uint64_t ContentLength, HANDLE BodySource);
     void TagImage(const std::string& Id, const std::string& Repo, const std::string& Tag);
     std::unique_ptr<HTTPRequestContext> PushImage(const std::string& ImageName, const std::optional<std::string>& tag, const std::string& registryAuth);
     std::string Authenticate(const std::string& serverAddress, const std::string& username, const std::string& password);
@@ -236,6 +241,13 @@ private:
     std::unique_ptr<HTTPRequestContext> SendRequestImpl(
         boost::beast::http::verb Method, const URL& Url, const std::string& Body, const std::map<std::string, std::string>& Headers = {});
 
+    // Streaming POST: writes the HTTP request and a Content-Length-bounded body by reading
+    // from BodySource in chunks via beast's buffer_body serializer. Use this for endpoints
+    // that take a large binary payload (LoadImage, ImportImage). Returns the HTTPRequestContext
+    // with the socket positioned to read the response.
+    std::unique_ptr<HTTPRequestContext> SendStreamRequest(
+        boost::beast::http::verb Method, const URL& Url, uint64_t ContentLength, std::string_view ContentType, HANDLE BodySource);
+
     std::pair<HTTPResponse, std::string> SendRequestAndReadResponse(
         boost::beast::http::verb Method, const URL& Url, const std::string& Body = "");
 
@@ -265,6 +277,11 @@ private:
 
         if constexpr (!std::is_same_v<TResponse, void>)
         {
+            if (body.empty())
+            {
+                return TResponse{};
+            }
+
             return wsl::shared::FromJson<TResponse>(body.c_str());
         }
     }

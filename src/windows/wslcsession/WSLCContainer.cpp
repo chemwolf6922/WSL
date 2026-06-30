@@ -53,6 +53,7 @@ using wsl::windows::service::wslc::WSLCPortMapping;
 using wsl::windows::service::wslc::WSLCSession;
 using wsl::windows::service::wslc::WSLCVirtualMachine;
 using wsl::windows::service::wslc::WSLCVolumeMount;
+using wsl::windows::service::wslc::WSLCVolumes;
 
 using namespace wsl::windows::common::io;
 using namespace wsl::windows::common::docker_schema;
@@ -66,6 +67,55 @@ using DockerInspectContainer = wsl::windows::common::docker_schema::InspectConta
 using WslcInspectContainer = wsl::windows::common::wslc_schema::InspectContainer;
 
 namespace {
+
+// Unlike dockerd, podman's compat container-attach API falls back to its Engine.DetachKeys -- which is
+// empty at runtime -- when the attach request carries no detachKeys, so the docker-default ctrl-p,ctrl-q
+// never detaches. Always send an explicit value, defaulting to ctrl-p,ctrl-q when the caller does not
+// specify one, so detaching works regardless of the backend's configured default.
+constexpr LPCSTR c_defaultDetachKeys = "ctrl-p,ctrl-q";
+
+// Whether a single detach-key token is valid per the moby/term format podman parses: a single
+// character, "DEL", or "ctrl-<X>" where X is one of @ a-z [ \ ] ^ _.
+bool IsValidDetachToken(std::string_view Token)
+{
+    if (Token.size() == 1 || Token == "DEL")
+    {
+        return true;
+    }
+
+    if (Token.size() == 6 && Token.starts_with("ctrl-"))
+    {
+        const char c = Token[5];
+        return c == '@' || (c >= 'a' && c <= 'z') || (c >= '[' && c <= '_');
+    }
+
+    return false;
+}
+
+std::optional<std::string> ResolveDetachKeys(LPCSTR DetachKeys)
+{
+    std::string keys = DetachKeys != nullptr ? DetachKeys : c_defaultDetachKeys;
+
+    // Validate up front so invalid keys fail with E_INVALIDARG. podman returns HTTP 500 (not 400) for
+    // invalid detach keys, which would otherwise surface as a generic E_FAIL. An empty string is valid
+    // and disables detach (matching podman); otherwise every comma-separated token must be valid.
+    if (!keys.empty())
+    {
+        for (size_t start = 0;;)
+        {
+            const auto comma = keys.find(',', start);
+            const auto token = std::string_view(keys).substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            THROW_HR_IF(E_INVALIDARG, !IsValidDetachToken(token));
+            if (comma == std::string::npos)
+            {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+
+    return std::optional<std::string>(std::move(keys));
+}
 
 std::vector<std::string> StringArrayToVector(const WSLCStringArray& array)
 {
@@ -155,6 +205,18 @@ uint16_t AllocateEphemeralPort(int family, const char* address)
 }
 
 constexpr std::string_view c_containerNetworkPrefix = "container:";
+
+// podman names its built-in default network "podman", whereas Docker (and the WSLC API contract)
+// call it "bridge". wslc does not reconfigure podman's default network, so this name is fixed; we
+// translate between the two at the API boundary so callers always see the Docker name "bridge".
+constexpr std::string_view c_podmanDefaultNetwork = "podman";
+
+// Map a caller-supplied (Docker-semantic) network name to the name podman expects. Only the default
+// network differs ("bridge" -> "podman"); every other name is identical across runtimes.
+std::string ToBackendNetworkName(std::string_view name)
+{
+    return name == "bridge" ? std::string{c_podmanDefaultNetwork} : std::string{name};
+}
 
 bool NetworkModeAllocatesVmPorts(std::string_view mode) noexcept
 {
@@ -439,7 +501,7 @@ std::string SerializeContainerMetadata(const WSLCContainerMetadataV1& metadata)
     return wsl::shared::ToJson(wrapper);
 }
 
-void ProcessNamedVolumes(const WSLCContainerOptions& containerOptions, wsl::windows::common::docker_schema::CreateContainer& request)
+void ProcessNamedVolumes(const WSLCContainerOptions& containerOptions, wsl::windows::common::docker_schema::CreateContainer& request, WSLCVolumes& volumes)
 {
     THROW_HR_IF(E_INVALIDARG, containerOptions.NamedVolumesCount > 0 && containerOptions.NamedVolumes == nullptr);
 
@@ -448,6 +510,15 @@ void ProcessNamedVolumes(const WSLCContainerOptions& containerOptions, wsl::wind
         const auto& nv = containerOptions.NamedVolumes[i];
         THROW_HR_IF_NULL_MSG(E_INVALIDARG, nv.Name, "NamedVolume at index %lu has null Name", i);
         THROW_HR_IF_NULL_MSG(E_INVALIDARG, nv.ContainerPath, "NamedVolume at index %lu has null ContainerPath", i);
+
+        // Synchronously own this named volume in wslcsession before the
+        // /containers/create call so that subsequent volume operations see a
+        // consistent view. podman's docker-compat /events stream emits
+        // volume.create asynchronously (or not at all) for container-create-
+        // driven implicit creates, which would otherwise leave m_volumes out
+        // of sync with the backend. No-op if the user (or an earlier mount in
+        // this same request) has already created the volume.
+        volumes.EnsureVolumeExists(nv.Name);
 
         wsl::windows::common::docker_schema::Mount mount{};
         mount.Source = std::string(nv.Name);
@@ -685,7 +756,7 @@ void WSLCContainerImpl::Attach(LPCSTR DetachKeys, WSLCHandle* Stdin, WSLCHandle*
 
     try
     {
-        ioHandle = m_dockerClient.AttachContainer(m_id, DetachKeys == nullptr ? std::nullopt : std::optional<std::string>(DetachKeys));
+        ioHandle = m_dockerClient.AttachContainer(m_id, ResolveDetachKeys(DetachKeys));
     }
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to attach to container '%hs'", m_id.c_str());
 
@@ -743,7 +814,7 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
 
     if (StartOptions != nullptr)
     {
-        detachKeys = StartOptions->DetachKeys != nullptr ? std::optional<std::string>(StartOptions->DetachKeys) : std::nullopt;
+        detachKeys = ResolveDetachKeys(StartOptions->DetachKeys);
 
         THROW_HR_IF_MSG(
             E_INVALIDARG,
@@ -752,6 +823,18 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
             StartOptions->TtyRows,
             StartOptions->TtyColumns);
     }
+
+    // Mount volumes and configure ports BEFORE attaching IO. podman's
+    // /containers/{id}/attach has a side effect of triggering conmon to set up
+    // the container's mount namespace, snapshotting whatever is at the bind
+    // source at that moment. If MountVolumes runs after attach, the virtiofs
+    // share is mounted in the system distro too late and the container's
+    // mount namespace never sees it (the bind ends up pointing at an empty
+    // overlay subdir). See p0-volume-bug-root-cause.md.
+    auto volumeCleanup = MountVolumes(m_mountedVolumes, m_virtualMachine);
+
+    auto portCleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this]() { UnmapPorts(); });
+    MapPorts();
 
     // Attach to the container's init process so no IO is lost.
     std::unique_ptr<WSLCProcessIO> io;
@@ -806,11 +889,6 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
         WSLC_E_VOLUME_NOT_AVAILABLE,
         Localization::MessageWslcVolumeNotAvailable(wsl::shared::string::Join(unavailableVolumes, ',')),
         !unavailableVolumes.empty());
-
-    auto volumeCleanup = MountVolumes(m_mountedVolumes, m_virtualMachine);
-
-    auto portCleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this]() { UnmapPorts(); });
-    MapPorts();
 
     m_stopNotification.Event.ResetEvent();
     m_stopNotification.EventTime.store(0, std::memory_order_relaxed);
@@ -944,6 +1022,12 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
         SignalArg = Signal;
     }
 
+    std::optional<ULONG> TimeoutArg;
+    if (TimeoutSeconds >= 0)
+    {
+        TimeoutArg = static_cast<ULONG>(TimeoutSeconds);
+    }
+
     // Don't wait for the container to stop if we're not sending SIGKILL, since it may not stop the container.
     // N.B. If the signal was SIGTERM for instance, we'll receive the stop notification via OnEvent().
     bool waitForStop = !Kill || (SignalArg.value_or(WSLCSignalSIGKILL) == WSLCSignalSIGKILL);
@@ -961,25 +1045,24 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
         }
         else
         {
-            std::optional<ULONG> TimeoutArg;
-            if (TimeoutSeconds >= 0)
-            {
-                TimeoutArg = static_cast<ULONG>(TimeoutSeconds);
-            }
-
+            // podman's /stop honors ?signal= (a system-distro patch until it's upstream) and blocks
+            // until exit, escalating to SIGKILL after the timeout -- forward both and let podman own it.
             m_dockerClient.StopContainer(m_id, SignalArg, TimeoutArg);
         }
     }
     catch (const DockerHTTPException& e)
     {
-        // HTTP 304 is returned when the container is already stopped.
-        if (Kill || e.StatusCode() != 304)
+        // 304 = already stopped (e.g. a short-lived container that exited between our state check
+        // and this call); Stop() is idempotent. Kill() keeps its strict behavior.
+        const bool alreadyStopped = !Kill && e.StatusCode() == 304;
+        if (!alreadyStopped)
         {
             THROW_DOCKER_USER_ERROR_MSG(e, "Failed to %hs container '%hs'", Kill ? "kill" : "stop", m_id.c_str());
         }
     }
 
-    // Wait for the stop event to get the Docker timestamp.
+    // The container has already exited (/stop blocks until it does); wait for the async stop event
+    // from OnEvent() to read its precise Docker timestamp.
     std::optional<std::uint64_t> stopTimestamp;
     if (m_wslcSession.WaitForEventOrSessionTerminating(m_stopNotification.Event.get(), 60s))
     {
@@ -1194,10 +1277,8 @@ void WSLCContainerImpl::Exec(const WSLCProcessOptions* Options, const WSLCProces
         request.AttachStdin = true;
     }
 
-    if (StartOptions != nullptr && StartOptions->DetachKeys != nullptr)
-    {
-        request.DetachKeys = StartOptions->DetachKeys;
-    }
+    // Always send explicit detach keys so detaching does not depend on the backend's configured default.
+    request.DetachKeys = ResolveDetachKeys(StartOptions != nullptr ? StartOptions->DetachKeys : nullptr);
 
     try
     {
@@ -1206,9 +1287,16 @@ void WSLCContainerImpl::Exec(const WSLCProcessOptions* Options, const WSLCProces
         // N.B. There's no way to delete a created exec instance, it is removed when the container is deleted.
 
         wil::unique_handle stream{
-            (HANDLE)m_dockerClient
-                .StartExec(result.Id, common::docker_schema::StartExec{.Tty = request.Tty, .ConsoleSize = request.ConsoleSize})
-                .release()};
+            (HANDLE)m_dockerClient.StartExec(result.Id, common::docker_schema::StartExec{.Tty = request.Tty}).release()};
+
+        if (request.Tty && StartOptions->TtyRows != 0 && StartOptions->TtyColumns != 0)
+        {
+            try
+            {
+                m_dockerClient.ResizeExecTty(result.Id, StartOptions->TtyRows, StartOptions->TtyColumns);
+            }
+            CATCH_LOG()
+        }
 
         std::unique_ptr<WSLCProcessIO> io;
         if (request.Tty)
@@ -1249,7 +1337,7 @@ void WSLCContainerImpl::Exec(const WSLCProcessOptions* Options, const WSLCProces
                 control->SetPid(state.Pid);
                 break; // Exec is running, exit.
             }
-            else if (state.ExitCode.has_value())
+            else if (!state.Running && state.ExitCode.has_value())
             {
                 control->SetExitCode(state.ExitCode.value());
                 break; // Exec has exited, exit.
@@ -1287,7 +1375,10 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
     wslcInspect.State.StartedAt = dockerInspect.State.StartedAt;
     wslcInspect.State.FinishedAt = dockerInspect.State.FinishedAt;
 
-    wslcInspect.HostConfig.NetworkMode = dockerInspect.HostConfig.NetworkMode;
+    // Echo the network mode requested at create time so a custom network reports its name (the
+    // Docker contract) instead of podman's collapsed "bridge". Falls back to podman's reported
+    // value for recovered containers, where m_requestedNetworkMode is unset.
+    wslcInspect.HostConfig.NetworkMode = m_requestedNetworkMode.value_or(dockerInspect.HostConfig.NetworkMode);
     wslcInspect.HostConfig.Memory = dockerInspect.HostConfig.Memory;
     wslcInspect.HostConfig.NanoCpus = dockerInspect.HostConfig.NanoCpus;
 
@@ -1296,7 +1387,22 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
         wslcInspect.HostConfig.Ulimits.reserve(dockerInspect.HostConfig.Ulimits->size());
         for (const auto& ulimit : dockerInspect.HostConfig.Ulimits.value())
         {
-            wslcInspect.HostConfig.Ulimits.push_back({ulimit.Name, ulimit.Soft, ulimit.Hard});
+            // podman's inspect reports ulimit names as the rlimit constant (e.g. "RLIMIT_NOFILE"),
+            // while dockerd and our API contract use the short lowercase form ("nofile"). Normalize
+            // back to the Docker name so a create/inspect round-trip is stable.
+            std::string name = ulimit.Name;
+            if (name.starts_with("RLIMIT_"))
+            {
+                name = name.substr(7);
+                for (auto& c : name)
+                {
+                    if (c >= 'A' && c <= 'Z')
+                    {
+                        c = static_cast<char>(c - 'A' + 'a');
+                    }
+                }
+            }
+            wslcInspect.HostConfig.Ulimits.push_back({std::move(name), ulimit.Soft, ulimit.Hard});
         }
     }
 
@@ -1358,7 +1464,9 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
     // Map labels. m_labels should already exclude internal metadata labels.
     wslcInspect.Labels = m_labels;
 
-    // Map per-endpoint network settings from Docker inspect data.
+    // Map per-endpoint network settings from the backend inspect data. podman reports its built-in
+    // default network under the name "podman"; translate it back to the Docker name "bridge" so the
+    // inspect output honors the Docker contract (consistent with HostConfig.NetworkMode above).
     for (const auto& [name, endpoint] : dockerInspect.NetworkSettings.Networks)
     {
         wslc_schema::InspectEndpointSettings wslcEndpoint{};
@@ -1367,7 +1475,9 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
         wslcEndpoint.MacAddress = endpoint.MacAddress;
         wslcEndpoint.IPPrefixLen = endpoint.IPPrefixLen;
         wslcEndpoint.Aliases = endpoint.Aliases.value_or(std::vector<std::string>{});
-        wslcInspect.NetworkSettings.Networks[name] = std::move(wslcEndpoint);
+
+        std::string key = (name == c_podmanDefaultNetwork) ? std::string{"bridge"} : name;
+        wslcInspect.NetworkSettings.Networks[std::move(key)] = std::move(wslcEndpoint);
     }
 
     return wslcInspect;
@@ -1579,7 +1689,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         }
     }
 
-    ProcessNamedVolumes(containerOptions, request);
+    ProcessNamedVolumes(containerOptions, request, volumesManager);
 
     // Configure GPU support if requested.
     if (WI_IsFlagSet(containerOptions.Flags, WSLCContainerFlagsGpu))
@@ -1677,9 +1787,16 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         // In that networking mode, the host port always matches the vm port.
         auto hostPort = e.VmMapping.VmPort ? e.VmMapping.VmPort->Port() : e.VmMapping.HostPort();
 
-        // Use catch-all binding address based on the address family. :: binds all ipv6 interfaces, and 0:0:0:0 binds all ipv4 interfaces.
-        portEntry.emplace_back(common::docker_schema::PortMapping{
-            .HostIp = e.VmMapping.IsIPv6() ? "::" : "0.0.0.0", .HostPort = std::to_string(hostPort)});
+        // The runtime must publish each port where the host-side forwarding path will connect to it.
+        // The wslrelay (hvsocket) relay connects over VM loopback using VMPortMapping::ConnectFamily(),
+        // so publish on the matching loopback address -- PublishHostIp() applies the IPv6->IPv4 loopback
+        // workaround for container-published ::1 ports. The consomme/virtionet proxy instead reaches the
+        // port via a catch-all bind, so publish on the family wildcard (:: binds all IPv6 interfaces,
+        // 0.0.0.0 binds all IPv4 interfaces).
+        std::string hostIp = virtualMachine.UseWslRelayPortForwarding() ? e.VmMapping.PublishHostIp()
+                                                                        : std::string{e.VmMapping.IsIPv6() ? "::" : "0.0.0.0"};
+
+        portEntry.emplace_back(common::docker_schema::PortMapping{.HostIp = std::move(hostIp), .HostPort = std::to_string(hostPort)});
     }
 
     auto labels = ParseKeyValuePairs(containerOptions.Labels, containerOptions.LabelsCount, WSLCContainerMetadataLabel);
@@ -1689,6 +1806,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     metadata.Flags = containerOptions.Flags;
     metadata.InitProcessFlags = containerOptions.InitProcessOptions.Flags;
     metadata.Volumes = volumes;
+    metadata.NetworkMode = networkMode;
 
     for (const auto& e : mappedPorts)
     {
@@ -1717,10 +1835,25 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     auto inspectData = DockerClient.InspectContainer(result.Id);
 
     // Post-create verification: confirm every requested network is actually attached.
-    // If Docker rejected any endpoint, throw here so deleteOnFailure cleans up the orphan container.
-    // container:<id> mode shares the target's netns, so the mode string is not a network name and
-    // won't appear in NetworkSettings.Networks. Skip the check for that mode.
-    if (!networkMode.starts_with(c_containerNetworkPrefix))
+    // If the backend rejected any endpoint, throw here so deleteOnFailure cleans up the orphan container.
+    //
+    // The primary network can only be verified by name for user-defined networks, whose names are
+    // authoritative and identical across runtimes. The built-in modes need special handling:
+    //   - container:<id> shares the target's netns, so the mode string is not a network name and
+    //     never appears in NetworkSettings.Networks.
+    //   - host/none attach no named endpoint at all (podman reports NetworkSettings.Networks as
+    //     empty), so there is nothing to verify. NetworkModeAllocatesVmPorts() is false for these.
+    //   - bridge is the default network: podman attaches it under its own fixed name "podman" rather
+    //     than the Docker name "bridge" (wslc does not reconfigure podman's default network), so
+    //     match against podman's name.
+    if (networkMode == "bridge")
+    {
+        THROW_HR_IF_MSG(
+            E_UNEXPECTED,
+            !inspectData.NetworkSettings.Networks.contains(std::string{c_podmanDefaultNetwork}),
+            "Container was created but the default network was not attached");
+    }
+    else if (NetworkModeAllocatesVmPorts(networkMode))
     {
         THROW_HR_IF_MSG(
             E_UNEXPECTED,
@@ -1750,6 +1883,19 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     // from this function.
     EventTracker.WaitForObjectCreated(result.Id);
 
+    // Register any anonymous volumes podman created implicitly for this container (e.g. from an
+    // image VOLUME instruction). Named volumes were already owned by ProcessNamedVolumes; this is a
+    // no-op for those. podman's docker-compat /events stream does not reliably emit volume.create
+    // for container-driven implicit volumes, so without this they would never be tracked and would
+    // be invisible to ListVolumes / wslc volume management.
+    for (const auto& mount : inspectData.Mounts)
+    {
+        if (mount.Type == "volume" && !mount.Name.empty())
+        {
+            volumesManager.TrackExistingVolume(mount.Name);
+        }
+    }
+
     // Collect the names of referenced docker named volumes so Start() can verify
     // they are available before running the container.
     std::vector<std::string> namedVolumes;
@@ -1766,7 +1912,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         std::move(result.Id),
         CleanContainerName(inspectData.Name),
         std::string(containerOptions.Image),
-        std::move(networkMode),
+        networkMode,
         std::move(volumes),
         std::move(namedVolumes),
         volumesManager,
@@ -1780,6 +1926,12 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         ParseDockerTimestamp(inspectData.Created),
         containerOptions.InitProcessOptions.Flags,
         containerOptions.Flags);
+
+    // Preserve the Docker-semantic network mode we requested; podman's inspect would otherwise
+    // report any bridge-driver network (default or custom) as just "bridge" (see member doc).
+    // N.B. networkMode is copied into the constructor above (for m_networkMode), so it is still
+    // valid to move here.
+    container->m_requestedNetworkMode = std::move(networkMode);
 
     deleteOnFailure.release();
     return container;
@@ -1872,6 +2024,13 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Open(
         static_cast<std::uint64_t>(dockerContainer.Created),
         metadata.InitProcessFlags,
         metadata.Flags);
+
+    // Restore the Docker-semantic network mode persisted at create time, so the recovered container
+    // reports the same NetworkMode (e.g. a custom network name) instead of podman's collapsed "bridge".
+    if (!metadata.NetworkMode.empty())
+    {
+        container->m_requestedNetworkMode = metadata.NetworkMode;
+    }
 
     // Restore the state change timestamp from Docker inspect data.
     try
@@ -2460,7 +2619,7 @@ void WSLCContainerImpl::ConnectToNetwork(const WSLCNetworkConnectionOptions* Opt
 
     try
     {
-        m_dockerClient.ConnectContainerToNetwork(Options->NetworkName, request);
+        m_dockerClient.ConnectContainerToNetwork(ToBackendNetworkName(Options->NetworkName), request);
     }
     catch (const DockerHTTPException& e)
     {
@@ -2492,7 +2651,7 @@ void WSLCContainerImpl::DisconnectFromNetwork(LPCSTR NetworkName)
 
     try
     {
-        m_dockerClient.DisconnectContainerFromNetwork(NetworkName, request);
+        m_dockerClient.DisconnectContainerFromNetwork(ToBackendNetworkName(NetworkName), request);
     }
     catch (const DockerHTTPException& e)
     {

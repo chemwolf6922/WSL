@@ -58,7 +58,11 @@ class WSLCE2EImageSaveTests
     WSLC_TEST_METHOD(WSLCE2E_Image_Save_ImageNotFound)
     {
         const auto result = RunWslc(std::format(L"image save --output \"{}\" {}", SavedArchivePath.wstring(), InvalidImage.NameAndTag()));
-        result.Verify({.Stdout = L"", .Stderr = L"reference does not exist\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n", .ExitCode = 1});
+        const auto expected = std::format(
+            L"failed to find image {}: {}: image not known\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n",
+            InvalidImage.NameAndTag(),
+            InvalidImage.NameAndTag());
+        result.Verify({.Stdout = L"", .Stderr = expected, .ExitCode = 1});
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Image_Save_Success)
@@ -66,10 +70,17 @@ class WSLCE2EImageSaveTests
         const auto result = RunWslc(std::format(L"image save --output \"{}\" {}", SavedArchivePath.wstring(), DebianImage.NameAndTag()));
         result.Verify({.Stdout = L"", .Stderr = L"", .ExitCode = 0});
 
+        // Verify the archive was written. We deliberately do NOT compare its
+        // byte length against DebianImage.Path: the test data ships as an OCI
+        // Image Layout (index.json + blobs/sha256/...), while podman's
+        // docker-compat /images/get endpoint emits the Docker v1 image
+        // format (<config>.json + <layer-id>/layer.tar). Both contain the
+        // same byte-identical layer blob (SHA-256 content-addressed), but
+        // different wrapper metadata yields a tar that's a few KB smaller.
+        // Functional equivalence (save -> load -> run roundtrip) is covered
+        // by WSLCE2E_Image_Save_Load below.
         VERIFY_IS_TRUE(std::filesystem::exists(SavedArchivePath));
-        auto sourceFileSize = std::filesystem::file_size(DebianImage.Path);
-        auto archiveFileSize = std::filesystem::file_size(SavedArchivePath);
-        VERIFY_ARE_EQUAL(sourceFileSize, archiveFileSize);
+        VERIFY_IS_GREATER_THAN_OR_EQUAL(std::filesystem::file_size(SavedArchivePath), static_cast<uintmax_t>(1024 * 1024));
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Image_Save_Load)
@@ -95,10 +106,11 @@ class WSLCE2EImageSaveTests
         const auto result = RunWslcAndRedirectToFile(std::format(L"image save {}", DebianImage.NameAndTag()), SavedArchivePath);
         result.Verify({.Stdout = L"", .Stderr = L"", .ExitCode = 0});
 
+        // See WSLCE2E_Image_Save_Success for why we don't compare byte sizes:
+        // source tar uses OCI Image Layout, podman save emits Docker v1
+        // format. Layer data is byte-identical; only wrapper metadata differs.
         VERIFY_IS_TRUE(std::filesystem::exists(SavedArchivePath));
-        auto sourceFileSize = std::filesystem::file_size(DebianImage.Path);
-        auto archiveFileSize = std::filesystem::file_size(SavedArchivePath);
-        VERIFY_ARE_EQUAL(sourceFileSize, archiveFileSize);
+        VERIFY_IS_GREATER_THAN_OR_EQUAL(std::filesystem::file_size(SavedArchivePath), static_cast<uintmax_t>(1024 * 1024));
     }
 
     WSLC_TEST_METHOD(WSLCE2E_Image_Save_ToTerminal_Fail)

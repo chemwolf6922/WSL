@@ -88,7 +88,9 @@ class WSLCE2EPushPullTests
     WSLC_TEST_METHOD(WSLCE2E_Image_Push_NonExistentImage)
     {
         auto result = RunWslc(L"push does-not-exist:latest");
-        auto errorMessage = L"An image does not exist locally with the tag: does-not-exist\r\nError code: E_FAIL\r\n";
+        auto errorMessage =
+            L"failed to find image docker.io/library/does-not-exist:latest: docker.io/library/does-not-exist:latest: image not "
+            L"known\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n";
         result.Verify({.Stdout = L"", .Stderr = errorMessage, .ExitCode = 1});
     }
 
@@ -96,8 +98,7 @@ class WSLCE2EPushPullTests
     {
         auto result = RunWslc(L"pull does-not-exist:latest");
         auto errorMessage =
-            L"pull access denied for does-not-exist, repository does not exist or may require 'docker login': denied: requested "
-            L"access to the resource is denied\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n";
+            L"{\"message\":\"denied: requested access to the resource is denied\"}\r\n\r\nError code: WSLC_E_IMAGE_NOT_FOUND\r\n";
         result.Verify({.Stdout = L"", .Stderr = errorMessage, .ExitCode = 1});
     }
 

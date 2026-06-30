@@ -2,6 +2,12 @@
 
 #include <iostream>
 #include <filesystem>
+#include <chrono>
+#include <thread>
+#include <ifaddrs.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <lxwil.h>
 #include "lxinitshared.h"
 #include "common.h"
@@ -11,6 +17,7 @@
 #include "conncheckshared.h"
 #include "RuntimeErrorWithSourceLocation.h"
 #include "stringshared.h"
+#include "retryshared.h"
 
 // Custom table used for storing routes for loopback IPs.
 constexpr int c_loopbackRoutingTableId = 127;
@@ -305,6 +312,21 @@ void NetworkManager::InitializeLoopbackConfiguration(Interface& gelnic, wsl::sha
 
     InitializeLoopbackConfigurationImpl(gelnic, AF_INET);
     // InitializeLoopbackConfigurationImpl(gelnic, AF_INET6);
+
+    {
+        // Emit a packet so consomme can learn loopback0's global ipv6 address.
+        EmitConsommeIpv6LearningPacket(gelnic);
+
+        // Static neighbor so packets to the virtual range leave loopback0 with consomme's gateway MAC.
+        Neighbor neighbor = Neighbor(c_ipv6LoopbackGateway, c_gatewayMacAddress, gelnic.Index());
+        neighborManager.ModifyNeighborEntry(neighbor, Operation::Create);
+
+        // Route consomme's virtual source range out loopback0 via the loopback gateway.
+        const Address virtualRange = {AF_INET6, 96, "2001:abcd::ff:fe00:0:0"};
+        Route route = Route(AF_INET6, c_ipv6LoopbackGateway, gelnic.Index(), false, virtualRange, 0);
+        RoutingTable mainRoutingTable(RT_TABLE_MAIN);
+        mainRoutingTable.ModifyRoute(route, Operation::Create);
+    }
 }
 
 /*
@@ -546,3 +568,59 @@ wsl::shared::conncheck::ConnCheckResult NetworkManager::SendConnectRequest(const
 {
     return wsl::shared::conncheck::CheckConnection(remoteAddress, nullptr, "80");
 }
+
+void NetworkManager::EmitConsommeIpv6LearningPacket(const Interface& gelnic)
+try
+{
+    const std::string ifName = gelnic.Name();
+
+    // Find loopback0's global (non-link-local) IPv6 address, retrying until SLAAC assigns it.
+    sockaddr_in6 globalSrc = wsl::shared::retry::RetryWithTimeout<sockaddr_in6>(
+        [&ifName]() {
+            ifaddrs* list = nullptr;
+            THROW_LAST_ERROR_IF(getifaddrs(&list) != 0);
+            auto freeList = wil::scope_exit([&] { freeifaddrs(list); });
+            for (ifaddrs* ifa = list; ifa != nullptr; ifa = ifa->ifa_next)
+            {
+                if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET6 || ifName != ifa->ifa_name)
+                {
+                    continue;
+                }
+                auto* sa = reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr);
+                if (IN6_IS_ADDR_LINKLOCAL(&sa->sin6_addr) || IN6_IS_ADDR_LOOPBACK(&sa->sin6_addr))
+                {
+                    continue;
+                }
+                return *sa;
+            }
+            throw RuntimeErrorWithSourceLocation("loopback0 has no global IPv6 address yet");
+        },
+        std::chrono::milliseconds(100),
+        std::chrono::seconds(1));
+
+    char addrStr[INET6_ADDRSTRLEN] = {};
+    THROW_LAST_ERROR_IF(inet_ntop(AF_INET6, &globalSrc.sin6_addr, addrStr, sizeof(addrStr)) == nullptr);
+    GNS_LOG_INFO("Emitting learning packet from loopback0 global address {}", addrStr);
+
+    wil::unique_fd sock{socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    THROW_LAST_ERROR_IF(!sock);
+
+    // Egress on loopback0 so consomme (the only peer on that link) snoops the packet.
+    int ifIndex = gelnic.Index();
+    THROW_LAST_ERROR_IF(setsockopt(sock.get(), IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifIndex, sizeof(ifIndex)) != 0);
+
+    // Bind the global address as the source (also confirms it is assigned and usable).
+    globalSrc.sin6_port = 0;
+    THROW_LAST_ERROR_IF(bind(sock.get(), reinterpret_cast<sockaddr*>(&globalSrc), sizeof(globalSrc)) != 0);
+
+    // Global-scope multicast: needs no unicast route (2001:abcd:: is off-link) yet still leaves with the
+    // global source.
+    sockaddr_in6 dst{};
+    dst.sin6_family = AF_INET6;
+    dst.sin6_port = htons(9); // discard
+    THROW_ERRNO_IF(EINVAL, inet_pton(AF_INET6, "ff0e::1", &dst.sin6_addr) != 1);
+
+    const char payload = 0;
+    THROW_LAST_ERROR_IF(sendto(sock.get(), &payload, sizeof(payload), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0);
+}
+CATCH_LOG()

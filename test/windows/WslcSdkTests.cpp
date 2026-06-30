@@ -2215,7 +2215,7 @@ class WslcSdkTests
     // Starts a local registry container with host-mode networking and returns [container, registryAddress].
     // Uses the COM API (via GetInternalType) with WSLCContainerLauncher to get host-mode networking,
     // which the SDK doesn't expose. Host networking shares the VM's network namespace, so the registry
-    // is reachable at 127.0.0.1:<port> from both dockerd (inside the VM) and the host.
+    // is reachable at localhost:<port> from both the runtime (inside the VM) and the host.
     std::pair<wsl::windows::common::RunningWSLCContainer, std::string> StartLocalRegistry(
         const std::string& username = {}, const std::string& password = {}, uint16_t port = 5000)
     {
@@ -2410,7 +2410,7 @@ class WslcSdkTests
             opts.registryAuth = emptyRegistryAuth.c_str();
 
             wil::unique_cotaskmem_string errorMsg;
-            VERIFY_ARE_EQUAL(WslcPushSessionImage(m_defaultSession, &opts, &errorMsg), E_FAIL);
+            VERIFY_ARE_EQUAL(WslcPushSessionImage(m_defaultSession, &opts, &errorMsg), WSLC_E_IMAGE_NOT_FOUND);
             VERIFY_IS_NOT_NULL(errorMsg.get());
         }
 

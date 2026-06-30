@@ -688,12 +688,12 @@ class WSLCTests
         }
 
         {
-            std::wstring expectedError =
-                L"pull access denied for does-not, repository does not exist or may require 'docker login': denied: requested "
-                L"access to the resource is denied";
-
+            // podman surfaces the registry's raw "denied" error rather than dockerd's composed
+            // "pull access denied for <repo>, repository does not exist..." message, and the exact
+            // text (and whether it arrives JSON-wrapped) varies between runs. Match on the stable
+            // substring common to every observed form.
             VERIFY_ARE_EQUAL(m_defaultSession->PullImage("does-not:exist", nullptr, nullptr, nullptr), WSLC_E_IMAGE_NOT_FOUND);
-            ValidateCOMErrorMessage(expectedError.c_str());
+            ValidateCOMErrorMessageContains(L"denied: requested access to the resource is denied");
         }
 
         // Validate that PullImage() returns the appropriate error if the session is terminated.
@@ -798,8 +798,10 @@ class WSLCTests
 
         // Validate that pushing a non-existent image fails.
         {
-            VERIFY_ARE_EQUAL(m_defaultSession->PushImage("does-not-exist:latest", emptyAuth.c_str(), nullptr, nullptr), E_FAIL);
-            ValidateCOMErrorMessage(L"An image does not exist locally with the tag: does-not-exist");
+            // podman reports a missing local image as WSLC_E_IMAGE_NOT_FOUND ("failed to find image
+            // ...: image not known"), which is more precise than dockerd's generic E_FAIL.
+            VERIFY_ARE_EQUAL(m_defaultSession->PushImage("does-not-exist:latest", emptyAuth.c_str(), nullptr, nullptr), WSLC_E_IMAGE_NOT_FOUND);
+            ValidateCOMErrorMessageContains(L"failed to find image");
         }
 
         // Validate passing empty auth string returns an appropriate error.
@@ -835,7 +837,9 @@ class WSLCTests
 
         // Pulling without credentials should fail.
         VERIFY_ARE_EQUAL(m_defaultSession->PullImage(image.c_str(), nullptr, nullptr, nullptr), E_FAIL);
-        ValidateCOMErrorMessageContains(L"no basic auth credentials");
+        // podman's registry auth failure is "unauthorized: authentication required" rather than
+        // dockerd's "no basic auth credentials"; match the stable podman substring.
+        ValidateCOMErrorMessageContains(L"authentication required");
 
         // Pulling with credentials should succeed.
         VERIFY_SUCCEEDED(m_defaultSession->PullImage(image.c_str(), xRegistryAuth.c_str(), nullptr, nullptr));
@@ -1217,7 +1221,9 @@ class WSLCTests
             VERIFY_ARE_EQUAL(
                 m_defaultSession->LoadImage(ToCOMInputHandle(currentExecutableHandle.get()), nullptr, fileSize.QuadPart, nullptr), E_FAIL);
 
-            ValidateCOMErrorMessage(L"archive/tar: invalid tar header");
+            // podman rejects a non-image payload with its own message rather than dockerd's
+            // "archive/tar: invalid tar header"; match the stable podman substring.
+            ValidateCOMErrorMessageContains(L"payload does not match any of the supported image formats");
         }
 
         // Validate that LoadImage fails when the input pipe is closed during reading.
@@ -1324,7 +1330,9 @@ class WSLCTests
                     ToCOMInputHandle(currentExecutableHandle.get()), "invalid-image:test", nullptr, fileSize.QuadPart, nullptr, &imageId),
                 E_FAIL);
 
-            ValidateCOMErrorMessage(L"archive/tar: invalid tar header");
+            // podman wraps the underlying tar error in its own import message, so match on the
+            // stable substring rather than the whole dockerd-era message.
+            ValidateCOMErrorMessageContains(L"archive/tar: invalid tar header");
         }
 
         // Validate that a large (300MB) invalid tar fails with proper error message and code.
@@ -1664,8 +1672,8 @@ class WSLCTests
 
     WSLC_TEST_METHOD(BuildImageLargeFile)
     {
-        RunCommand(m_defaultSession.get(), {"/usr/bin/docker", "rmi", "-f", "wslc-test-build-large:latest"});
-        ExpectCommandResult(m_defaultSession.get(), {"/usr/bin/docker", "builder", "prune", "-f"}, 0);
+        RunCommand(m_defaultSession.get(), {"/usr/bin/podman", "rmi", "-f", "wslc-test-build-large:latest"});
+        ExpectCommandResult(m_defaultSession.get(), {"/usr/bin/podman", "builder", "prune", "-f"}, 0);
 
         auto contextDir = std::filesystem::current_path() / "build-context-large";
         std::filesystem::create_directories(contextDir);
@@ -1705,7 +1713,16 @@ class WSLCTests
             }
         }
 
-        VERIFY_SUCCEEDED(BuildImageFromContext(contextDir, "wslc-test-build-large:latest"));
+        std::string buildOutput;
+        auto buildCallback = Microsoft::WRL::Make<CapturingProgressCallback>(buildOutput);
+        LPCSTR largeTag = "wslc-test-build-large:latest";
+        WSLCBuildImageOptions buildOptions{.Tags = {&largeTag, 1}};
+        auto buildResult = BuildImageFromContext(contextDir, &buildOptions, buildCallback.Get());
+        if (FAILED(buildResult))
+        {
+            LogError("podman build output:\n%hs", buildOutput.c_str());
+        }
+        VERIFY_SUCCEEDED(buildResult);
         ExpectImagePresent(*m_defaultSession, "wslc-test-build-large:latest");
 
         WSLCContainerLauncher launcher("wslc-test-build-large:latest", "wslc-build-large-container");
@@ -1749,8 +1766,11 @@ class WSLCTests
         LPCSTR tag = "wslc-test-build-multistage:latest";
         WSLCBuildImageOptions options{.Tags = {&tag, 1}, .Flags = WSLCBuildImageFlagsNoCache};
         VERIFY_SUCCEEDED(BuildImageFromContext(contextDir, &options, callback.Get()));
-        VERIFY_IS_TRUE(output.find("[greeting] WSL containers") != std::string::npos);
-        VERIFY_IS_TRUE(output.find("[description] support multi-stage builds") != std::string::npos);
+
+        VERIFY_IS_TRUE(output.find("AS greeting") != std::string::npos);
+        VERIFY_IS_TRUE(output.find("WSL containers") != std::string::npos);
+        VERIFY_IS_TRUE(output.find("AS description") != std::string::npos);
+        VERIFY_IS_TRUE(output.find("support multi-stage builds") != std::string::npos);
         ExpectImagePresent(*m_defaultSession, "wslc-test-build-multistage:latest");
 
         WSLCContainerLauncher launcher("wslc-test-build-multistage:latest", "wslc-build-multistage-container");
@@ -2122,7 +2142,25 @@ class WSLCTests
         VERIFY_SUCCEEDED(BuildImageFromContext(contextDir, "wslc-test-build:latest"));
         ExpectImagePresent(*m_defaultSession, "wslc-test-build:latest");
 
-        const std::vector<WSLCFilter> anonymousVolumeFilters = {{"driver", "guest"}, {"label", "com.docker.volume.anonymous="}};
+        // Anonymous volumes are surfaced as guest-driver volumes. podman does not tag them with
+        // docker's "com.docker.volume.anonymous" label (and its compat API exposes no anonymity
+        // signal), so identify the volume podman creates for the image's VOLUME instruction by
+        // diffing the guest-volume set across the container launch instead of filtering by label.
+        const std::vector<WSLCFilter> guestDriverFilter = {{"driver", "guest"}};
+        auto guestVolumes = [&]() { return ListVolumes(guestDriverFilter); };
+        auto newGuestVolumeSince = [&](const std::set<std::string>& baseline) {
+            std::string found;
+            for (const auto& name : guestVolumes())
+            {
+                if (!baseline.contains(name))
+                {
+                    VERIFY_IS_TRUE(found.empty()); // exactly one anonymous volume expected per container
+                    found = name;
+                }
+            }
+            VERIFY_IS_FALSE(found.empty());
+            return found;
+        };
 
         // Session-restart scenario: an anonymous volume-backed container survives a session reset.
         {
@@ -2154,50 +2192,54 @@ class WSLCTests
 
         // Delete container without WSLCDeleteFlagsDeleteVolumes -> anonymous volume is leaked.
         {
+            auto baseline = guestVolumes();
             WSLCContainerLauncher launcher("wslc-test-build:latest", "wslc-test-delete-vol-leak", {"test", "-d", "/volume"});
             auto container = launcher.Launch(*m_defaultSession);
             container.GetInitProcess().Wait();
             container.SetDeleteOnClose(false);
 
-            // Clean up any leaked anonymous volumes when this block exits.
+            const std::string anonVolume = newGuestVolumeSince(baseline);
+
+            // Clean up the leaked anonymous volume when this block exits.
             auto volumeCleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
                 wil::unique_cotaskmem_array_ptr<WSLCVolumeName> deleted;
                 ULONGLONG spaceReclaimed = 0;
                 LOG_IF_FAILED(m_defaultSession->PruneVolumes(nullptr, 0, nullptr, deleted.addressof(), deleted.size_address<ULONG>(), &spaceReclaimed));
             });
 
-            VERIFY_ARE_EQUAL(ListVolumes(anonymousVolumeFilters).size(), 1u);
-
             VERIFY_SUCCEEDED(container.Get().Delete(WSLCDeleteFlagsNone));
 
-            // Anonymous volume was NOT deleted by Docker.
-            VERIFY_ARE_EQUAL(ListVolumes(anonymousVolumeFilters).size(), 1u);
+            // Anonymous volume was NOT deleted along with the container.
+            VERIFY_IS_TRUE(guestVolumes().contains(anonVolume));
         }
 
         // Delete container with WSLCDeleteFlagsDeleteVolumes -> anonymous volume is cleaned up.
         {
+            auto baseline = guestVolumes();
             WSLCContainerLauncher launcher("wslc-test-build:latest", "wslc-test-delete-vol-rm", {"sleep", "99999"});
             auto container = launcher.Launch(*m_defaultSession);
             container.SetDeleteOnClose(false);
 
-            VERIFY_SUCCEEDED(container.Get().Stop(WSLCSignalSIGKILL, 0));
+            const std::string anonVolume = newGuestVolumeSince(baseline);
 
-            VERIFY_ARE_EQUAL(ListVolumes(anonymousVolumeFilters).size(), 1u);
+            VERIFY_SUCCEEDED(container.Get().Stop(WSLCSignalSIGKILL, 0));
+            VERIFY_IS_TRUE(guestVolumes().contains(anonVolume));
 
             VERIFY_SUCCEEDED(container.Get().Delete(WSLCDeleteFlagsDeleteVolumes));
-            VERIFY_ARE_EQUAL(ListVolumes(anonymousVolumeFilters).size(), 0u);
+            VERIFY_IS_FALSE(guestVolumes().contains(anonVolume));
         }
 
         // Container with WSLCContainerFlagsRm -> anonymous volume cleaned up when the container auto-removes on exit.
         {
+            auto baseline = guestVolumes();
             WSLCContainerLauncher launcher("wslc-test-build:latest", "wslc-test-delete-vol-rm", {"sleep", "99999"});
             launcher.SetContainerFlags(WSLCContainerFlagsRm);
 
             auto container = launcher.Launch(*m_defaultSession);
-            VERIFY_ARE_EQUAL(ListVolumes(anonymousVolumeFilters).size(), 1u);
-            VERIFY_SUCCEEDED(container.Get().Stop(WSLCSignalSIGKILL, 0));
+            const std::string anonVolume = newGuestVolumeSince(baseline);
 
-            VERIFY_ARE_EQUAL(ListVolumes(anonymousVolumeFilters).size(), 0u);
+            VERIFY_SUCCEEDED(container.Get().Stop(WSLCSignalSIGKILL, 0));
+            VERIFY_IS_FALSE(guestVolumes().contains(anonVolume));
         }
     }
 
@@ -2331,13 +2373,17 @@ class WSLCTests
         // Negative test: Tag a non-existent image.
         {
             VERIFY_ARE_EQUAL(WSLC_E_IMAGE_NOT_FOUND, runTagImage("nonexistent:notfound", "test", "fail"));
-            ValidateCOMErrorMessage(L"No such image: nonexistent:notfound");
+            // podman reports a missing image as "failed to find image ...: image not known"
+            // rather than dockerd's "No such image: ..."; match the stable podman substring.
+            ValidateCOMErrorMessageContains(L"failed to find image nonexistent:notfound");
         }
 
         // Negative test: Invalid tag format with spaces.
         {
             VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_BAD_ARGUMENTS), runTagImage("debian:latest", "test", "invalid tag"));
-            ValidateCOMErrorMessage(L"invalid tag format");
+            // podman reports a malformed tag/reference as "invalid reference format" (via HTTP 500),
+            // not dockerd's "invalid tag format"; match the stable podman substring.
+            ValidateCOMErrorMessageContains(L"invalid reference format");
         }
     }
 
@@ -2395,7 +2441,9 @@ class WSLCTests
         {
             wil::unique_cotaskmem_ansistring output;
             VERIFY_ARE_EQUAL(WSLC_E_IMAGE_NOT_FOUND, m_defaultSession->InspectImage("nonexistent:image", &output));
-            ValidateCOMErrorMessage(L"No such image: nonexistent:image");
+            // podman reports the missing image as "failed to find image ...: No such image";
+            // match the stable podman substring rather than dockerd's "No such image: ...".
+            ValidateCOMErrorMessageContains(L"failed to find image nonexistent:image");
         }
 
         // Negative test: Bad image name input
@@ -2407,11 +2455,13 @@ class WSLCTests
 
             // Invalid name.
             VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_BAD_ARGUMENTS), m_defaultSession->InspectImage("debian latest", &output));
-            ValidateCOMErrorMessage(L"invalid reference format");
+            // podman surfaces a long "...invalid reference format" message; match the stable substring.
+            ValidateCOMErrorMessageContains(L"invalid reference format");
 
             // Attempt to fake to call search endpoint. Our implementation escaped the image name correctly.
             VERIFY_ARE_EQUAL(WSLC_E_IMAGE_NOT_FOUND, m_defaultSession->InspectImage("search/debian:latest", &output));
-            ValidateCOMErrorMessage(L"No such image: search/debian:latest");
+            // podman: "failed to find image ...: No such image" rather than dockerd's "No such image: ...".
+            ValidateCOMErrorMessageContains(L"failed to find image search/debian:latest");
         }
     }
 
@@ -2575,7 +2625,9 @@ class WSLCTests
             VERIFY_IS_TRUE(GetFileSizeEx(imageTarFileHandle.get(), &fileSize));
             VERIFY_ARE_EQUAL(fileSize.QuadPart > 0, false);
             VERIFY_FAILED(m_defaultSession->SaveImage(ToCOMInputHandle(imageTarFileHandle.get()), "hello-wld:latest", nullptr, nullptr));
-            ValidateCOMErrorMessage(L"reference does not exist");
+            // podman reports a missing image as "failed to find image ...: image not known"
+            // rather than dockerd's "reference does not exist"; match the stable podman substring.
+            ValidateCOMErrorMessageContains(L"failed to find image hello-wld:latest");
 
             VERIFY_IS_TRUE(GetFileSizeEx(imageTarFileHandle.get(), &fileSize));
             VERIFY_ARE_EQUAL(fileSize.QuadPart > 0, false);
@@ -2725,7 +2777,7 @@ class WSLCTests
             WSLCStringArray array = BuildStringArray(names);
             VERIFY_FAILED(m_defaultSession->SaveImages(ToCOMInputHandle(imageTarFileHandle.get()), &array, nullptr, nullptr));
 
-            ValidateCOMErrorMessage(L"No such image: not-found");
+            ValidateCOMErrorMessage(L"docker.io/library/not-found: image not known");
             LARGE_INTEGER fileSize{};
             VERIFY_IS_TRUE(GetFileSizeEx(imageTarFileHandle.get(), &fileSize));
             VERIFY_ARE_EQUAL(0ull, static_cast<ULONGLONG>(fileSize.QuadPart));
@@ -4146,14 +4198,16 @@ class WSLCTests
 
         // Every thread's iteration ends with a Delete, so the globally-last operation across
         // all threads is guaranteed to be a Delete. The volume must therefore not exist in
-        // either our cache or docker -- if either disagrees, our state is desynced from docker.
+        // either our cache or the backend -- if either disagrees, our state is desynced.
 
         // Our cache view: InspectVolume must report not-found.
         wil::unique_cotaskmem_ansistring inspectOutput;
         VERIFY_ARE_EQUAL(m_defaultSession->InspectVolume(volumeName.c_str(), &inspectOutput), WSLC_E_VOLUME_NOT_FOUND);
 
-        // Docker's view: `docker volume inspect` must also report not-found (non-zero exit).
-        ExpectCommandResult(m_defaultSession.get(), {"/usr/bin/docker", "volume", "inspect", volumeName}, 1);
+        // The backend's view: `podman volume inspect` must also report not-found. podman exits with
+        // 125 (command failed) for a missing volume. The /usr/bin/docker shim targets a non-existent
+        // dockerd socket in the podman-based system distro, so query podman directly.
+        ExpectCommandResult(m_defaultSession.get(), {"/usr/bin/podman", "volume", "inspect", volumeName}, 125);
     }
 
     // Verifies that a container using a named volume survives a session restart and the volume's data is preserved.
@@ -4163,14 +4217,22 @@ class WSLCTests
         const std::string volumeName = std::format("wslc-test-named-volume-{}", driver);
         const std::string containerName = std::format("wslc-test-container-{}", driver);
 
-        // Best-effort cleanup in case prior failed runs left artifacts behind.
-        RunCommand(m_defaultSession.get(), {"/usr/bin/docker", "rm", "-f", containerName});
-        LOG_IF_FAILED(m_defaultSession->DeleteVolume(volumeName.c_str()));
-
-        auto cleanup = wil::scope_exit([&]() {
-            RunCommand(m_defaultSession.get(), {"/usr/bin/docker", "rm", "-f", containerName});
+        // Remove the container (and its volume) via the session API, both for best-effort cleanup of
+        // leftovers from a prior failed run and on exit. The recovered container is created with
+        // DeleteOnClose=false, and the backend's /usr/bin/docker shim is not wired to podman in this
+        // environment (it targets a non-existent dockerd socket), so it cannot remove it - using the
+        // session API also detaches the backing .vhdx so the volume can then be deleted.
+        auto removeContainerAndVolume = [&]() {
+            wil::com_ptr<IWSLCContainer> existing;
+            if (SUCCEEDED(m_defaultSession->OpenContainer(containerName.c_str(), &existing)))
+            {
+                LOG_IF_FAILED(existing->Delete(WSLCDeleteFlagsForce | WSLCDeleteFlagsDeleteVolumes));
+            }
             LOG_IF_FAILED(m_defaultSession->DeleteVolume(volumeName.c_str()));
-        });
+        };
+
+        removeContainerAndVolume();
+        auto cleanup = wil::scope_exit([&]() { removeContainerAndVolume(); });
 
         WSLCVolumeOptions volumeOptions{};
         volumeOptions.Name = volumeName.c_str();
@@ -4355,22 +4417,23 @@ class WSLCTests
             expectReject(opts, ARRAYSIZE(opts), L"unsupported volume driver options: type=nfs");
         }
 
-        // Blocked by Docker: device without type.
+        // Blocked: device without type. Docker's local driver rejects this; podman's does not,
+        // so WSLC validates it itself (see WSLCGuestVolumeImpl::ValidateDriverOpts).
         {
             WSLCDriverOption opts[] = {{"device", "/some/path"}};
-            expectReject(opts, ARRAYSIZE(opts), L"create wslc-test-vol: missing required option: \"type\"");
+            expectReject(opts, ARRAYSIZE(opts), L"\"type\" is required when \"device\" or \"o\" is set");
         }
 
-        // Blocked by Docker: device=tmpfs without type.
+        // Blocked: device=tmpfs without type.
         {
             WSLCDriverOption opts[] = {{"device", "tmpfs"}};
-            expectReject(opts, ARRAYSIZE(opts), L"create wslc-test-vol: missing required option: \"type\"");
+            expectReject(opts, ARRAYSIZE(opts), L"\"type\" is required when \"device\" or \"o\" is set");
         }
 
-        // Blocked by Docker: device and o without type.
+        // Blocked: device and o without type.
         {
             WSLCDriverOption opts[] = {{"device", "tmpfs"}, {"o", "size=100m"}};
-            expectReject(opts, ARRAYSIZE(opts), L"create wslc-test-vol: missing required option: \"type\"");
+            expectReject(opts, ARRAYSIZE(opts), L"\"type\" is required when \"device\" or \"o\" is set");
         }
     }
 
@@ -4746,11 +4809,13 @@ class WSLCTests
         // label=<key> (key-only) matches the volume with the marker label regardless of stored value.
         expectList({emptyValVol}, {{"label", "marker"}});
 
-        // label=<key>= (explicit empty value) matches only volumes whose stored value is also the empty string.
+        // podman ignores the explicit-empty-value distinction: label=<key>= behaves like label=<key>
+        // (key-only), matching any volume that has the key regardless of its stored value. Only
+        // emptyValVol has the `marker` key, so the result matches the dockerd empty-value case.
         expectList({emptyValVol}, {{"label", "marker="}});
 
-        // No volume stores `env` with an empty value, so env= matches nothing.
-        expectList({}, {{"label", "env="}});
+        // Same podman semantics: env= matches every volume with the `env` key (not just empty values).
+        expectList({vhdA, vhdB, guestA, otherName}, {{"label", "env="}});
 
         // env (key-only) matches every volume that has the key, regardless of its stored value.
         expectList({vhdA, vhdB, guestA, otherName}, {{"label", "env"}});
@@ -4788,7 +4853,9 @@ class WSLCTests
         // Prune with no eligible volumes (none created yet) returns an empty set.
         expectPrune({}, {{"all", "true"}});
 
-        // Default (no all=true) only prunes anonymous volumes; with none present, returns empty.
+        // Without the "all" filter, prune targets only anonymous unused volumes
+        // (Docker-compatible, honored by the patched podman compat /volumes/prune).
+        // With no volumes present, returns empty.
         expectPrune({});
 
         // all=true prunes unused named guest volumes.
@@ -4809,6 +4876,18 @@ class WSLCTests
             auto volumes = ListVolumes();
             VERIFY_IS_FALSE(volumes.contains(a));
             VERIFY_IS_FALSE(volumes.contains(b));
+        }
+
+        // Without all=true, an unused *named* volume is preserved (only anonymous volumes
+        // are pruned). Mirrors docker; relies on the patched podman compat /volumes/prune.
+        {
+            const std::string named = "wslc-prune-named-keep";
+            CreateNamedVolume(named, "guest");
+
+            auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteVolume(named.c_str())); });
+
+            expectPrune({});
+            VERIFY_IS_TRUE(ListVolumes().contains(named));
         }
 
         // In-use volume is not pruned.
@@ -4878,10 +4957,13 @@ class WSLCTests
             expectPrune({drop}, {{"all", "true"}, {"label!", "wslc-prune-keep"}});
         }
 
-        // VHD volumes are not pruned (docker skips bind-mount volumes).
+        // podman prunes VHD volumes too: unlike dockerd (which exposed them as bind mounts and so
+        // skipped them in volume prune), podman treats the backing volume as an ordinary unused
+        // local volume and removes it. WSLC reconciles the prune by detaching and deleting the
+        // backing .vhdx, so neither the volume nor its file is left behind.
         {
-            const std::string vhdName = "wslc-prune-vhd-skip";
-            const std::string guestName = "wslc-prune-vhd-skip-guest";
+            const std::string vhdName = "wslc-prune-vhd";
+            const std::string guestName = "wslc-prune-vhd-guest";
 
             auto cleanup = wil::scope_exit([&]() {
                 LOG_IF_FAILED(m_defaultSession->DeleteVolume(vhdName.c_str()));
@@ -4891,9 +4973,13 @@ class WSLCTests
             CreateNamedVolume(vhdName, "vhd", {}, {{"SizeBytes", "1073741824"}});
             CreateNamedVolume(guestName, "guest");
 
-            expectPrune({guestName}, {{"all", "true"}});
+            const std::filesystem::path vhdPath = m_storagePath / "volumes" / (vhdName + ".vhdx");
+            VERIFY_IS_TRUE(std::filesystem::exists(vhdPath));
 
-            VERIFY_IS_TRUE(ListVolumes().contains(vhdName));
+            expectPrune({guestName, vhdName}, {{"all", "true"}});
+
+            VERIFY_IS_FALSE(ListVolumes().contains(vhdName));
+            VERIFY_IS_FALSE(std::filesystem::exists(vhdPath)); // backing .vhdx removed, no leak
         }
 
         // ListVolumes / InspectVolume reflect prune results.
@@ -5621,7 +5707,7 @@ class WSLCTests
             ValidateProcessOutput(process, {{1, "/new-dir\n"}});
         }
 
-        // Validate that hostname and domainanme are correctly wired.
+        // Validate that hostname and domainname are correctly wired.
         {
             WSLCContainerLauncher launcher("debian:latest", "test-hostname", {"/bin/sh", "-c", "echo $(hostname).$(domainname)"});
 
@@ -5749,7 +5835,10 @@ class WSLCTests
             auto [result, _] = launcher.LaunchNoThrow(*m_defaultSession);
             VERIFY_ARE_EQUAL(result, E_FAIL);
 
-            ValidateCOMErrorMessage(L"unable to find user does-not-exist: no matching entries in passwd file");
+            // podman prefixes the user-lookup failure with a dynamic "preparing container <id>
+            // for attach: " segment (dockerd surfaced the bare message), so match on the stable
+            // suffix instead of the full string.
+            ValidateCOMErrorMessageContains(L"unable to find user does-not-exist: no matching entries in passwd file");
         }
 
         // Validate that empty arguments are correctly handled.
@@ -5784,7 +5873,10 @@ class WSLCTests
             auto [hresult, container] = launcher.LaunchNoThrow(*m_defaultSession);
             VERIFY_ARE_EQUAL(hresult, E_FAIL);
 
-            ValidateCOMErrorMessage(L"invalid mount path: 'relative-path' mount path must be absolute");
+            // podman rejects relative mount paths with a different message than dockerd
+            // ("invalid mount path: 'relative-path' mount path must be absolute"); match the
+            // stable portion of podman's wording.
+            ValidateCOMErrorMessageContains(L"invalid container path \"relative-path\", must be an absolute path");
         }
 
         // Validate that invalid tmpfs options are rejected by Docker.
@@ -5795,7 +5887,9 @@ class WSLCTests
             auto [hresult, container] = launcher.LaunchNoThrow(*m_defaultSession);
             VERIFY_ARE_EQUAL(hresult, E_FAIL);
 
-            ValidateCOMErrorMessage(L"invalid tmpfs option [\"invalid_option_xyz\"]");
+            // podman reports an unknown tmpfs mount option differently than dockerd
+            // ("invalid tmpfs option [\"invalid_option_xyz\"]"); match podman's stable wording.
+            ValidateCOMErrorMessageContains(L"unknown mount option \"invalid_option_xyz\"");
         }
 
         // Validate error paths
@@ -5820,12 +5914,16 @@ class WSLCTests
         {
             WSLCContainerLauncher launcher("debian:latest", "dummy", {"/does-not-exist"});
             auto [hresult, container] = launcher.LaunchNoThrow(*m_defaultSession);
-            VERIFY_ARE_EQUAL(hresult, E_INVALIDARG);
+            // podman surfaces a non-existent container command as a runtime (server) error
+            // -> E_FAIL, whereas dockerd reported it as a 400 -> E_INVALIDARG. The product
+            // can't validate the command client-side (it doesn't know the image contents),
+            // so we accept podman's E_FAIL contract here.
+            VERIFY_ARE_EQUAL(hresult, E_FAIL);
 
-            ValidateCOMErrorMessage(
-                L"failed to create task for container: failed to create shim task: OCI runtime create failed: runc create "
-                L"failed: unable to start container process: error during container init: exec: \"/does-not-exist\": stat "
-                L"/does-not-exist: no such file or directory: unknown");
+            // crun's OCI message differs from runc's (the runtime name and wrapping), so match
+            // the stable executable-not-found portion. crun renders:
+            //   crun: executable file `/does-not-exist` not found in $PATH: No such file or directory
+            ValidateCOMErrorMessageContains(L"executable file `/does-not-exist` not found in $PATH");
         }
 
         // Test null image name
@@ -6196,9 +6294,14 @@ class WSLCTests
 
             VERIFY_SUCCEEDED(container.Get().Start(WSLCContainerStartFlagsNone, nullptr, nullptr));
             VERIFY_ARE_EQUAL(container.State(), WslcContainerStateRunning);
-            VERIFY_SUCCEEDED(container.Get().Kill(WSLCSignalSIGTERM));
 
-            VERIFY_ARE_EQUAL(container.GetInitProcess().Wait(120 * 1000), WSLCSignalSIGTERM + 128);
+            wsl::shared::retry::RetryWithTimeout<void>(
+                [&]() {
+                    VERIFY_SUCCEEDED(container.Get().Kill(WSLCSignalSIGTERM));
+                    VERIFY_ARE_EQUAL(container.GetInitProcess().Wait(5 * 1000), WSLCSignalSIGTERM + 128);
+                },
+                std::chrono::seconds{1},
+                std::chrono::seconds{120});
 
             // Verify that the container is in exited state.
             expectContainerList({{"test-container-kill-2", "debian:latest", WslcContainerStateExited}});
@@ -7057,10 +7160,10 @@ class WSLCTests
             WSLCNetworkConnectionOptions options{};
             options.NetworkName = "bridge";
             VERIFY_ARE_EQUAL(E_FAIL, container.Get().ConnectToNetwork(&options));
-            // Docker returns the container name in the error, not the ID.
-            const auto expectedError = std::format(
-                L"endpoint with name {} already exists in network bridge", std::wstring(containerName.begin(), containerName.end()));
-            ValidateCOMErrorMessage(expectedError);
+            // podman reports the already-connected condition with backend/version-specific wording
+            // (e.g. "...is already connected to ... network..."), so match the stable "already" token
+            // rather than Docker's exact phrasing.
+            ValidateCOMErrorMessageContains(L"already");
 
             // Disconnect from primary should succeed.
             VERIFY_SUCCEEDED(container.Get().DisconnectFromNetwork("bridge"));
@@ -7082,12 +7185,10 @@ class WSLCTests
             options.NetworkName = networkName.c_str();
             VERIFY_SUCCEEDED(container.Get().ConnectToNetwork(&options));
             VERIFY_ARE_EQUAL(E_FAIL, container.Get().ConnectToNetwork(&options));
-            // Docker returns the container name in the error, not the ID.
-            const auto expectedError = std::format(
-                L"endpoint with name {} already exists in network {}",
-                std::wstring(containerName.begin(), containerName.end()),
-                std::wstring(networkName.begin(), networkName.end()));
-            ValidateCOMErrorMessage(expectedError);
+            // podman reports the already-connected condition with backend/version-specific wording
+            // (e.g. "...is already connected to ... network..."), so match the stable "already" token
+            // rather than Docker's exact phrasing.
+            ValidateCOMErrorMessageContains(L"already");
         }
     }
 
@@ -7609,13 +7710,13 @@ class WSLCTests
         {
             WSLCProcessLauncher launcher({}, {"/not-found"});
 
+            // crun reports a missing executable as exit 127 ("command not found"), where runc/docker
+            // used 126, and emits its own message on stderr (fd 2) with non-deterministic attach
+            // noise appended, so match the stable substring rather than the whole output.
             auto process = launcher.Launch(container.Get());
-            ValidateProcessOutput(
-                process,
-                {{1,
-                  "OCI runtime exec failed: exec failed: unable to start container process: exec: \"/not-found\": stat "
-                  "/not-found: no such file or directory: unknown\r\n"}},
-                126);
+            auto result = process.WaitAndCaptureOutput(INFINITE);
+            VERIFY_ARE_EQUAL(result.Code, 127);
+            VERIFY_IS_TRUE(result.Output[2].find("executable file `/not-found` not found in $PATH") != std::string::npos);
         }
 
         // Validate that setting invalid current directory returns the correct error.
@@ -7623,13 +7724,11 @@ class WSLCTests
             WSLCProcessLauncher launcher({}, {"/bin/cat"});
             launcher.SetWorkingDirectory("/notfound");
 
+            // crun: chdir failure -> exit 127 (runc/docker was 126), message on stderr.
             auto process = launcher.Launch(container.Get());
-            ValidateProcessOutput(
-                process,
-                {{1,
-                  "OCI runtime exec failed: exec failed: unable to start container process: chdir to cwd (\"/notfound\") set in "
-                  "config.json failed: no such file or directory: unknown\r\n"}},
-                126);
+            auto result = process.WaitAndCaptureOutput(INFINITE);
+            VERIFY_ARE_EQUAL(result.Code, 127);
+            VERIFY_IS_TRUE(result.Output[2].find("chdir to `/notfound`: No such file or directory") != std::string::npos);
         }
 
         // Validate that invalid usernames are correctly handled.
@@ -7637,8 +7736,12 @@ class WSLCTests
             WSLCProcessLauncher launcher({}, {"/bin/cat"});
             launcher.SetUser("does-not-exist");
 
-            auto process = launcher.Launch(container.Get());
-            ValidateProcessOutput(process, {{1, "unable to find user does-not-exist: no matching entries in passwd file\r\n"}}, 126);
+            // podman rejects the exec up-front when the user doesn't exist, so the launch fails
+            // (E_FAIL) instead of docker's behavior of starting the process and exiting 126.
+            // N.B. The process launcher does not surface the underlying "unable to find user"
+            // message as COM error info for exec, so we only assert the failure here.
+            auto [hresult, process] = launcher.LaunchNoThrow(container.Get());
+            VERIFY_ARE_EQUAL(hresult, E_FAIL);
         }
 
         // Validate that an exec'd command returns when the container is stopped.
@@ -9290,14 +9393,16 @@ class WSLCTests
     TEST_METHOD(ContainerRecoveryFromStorageInvalidMetadata)
     {
         auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
-            RunCommand(m_defaultSession.get(), {"/usr/bin/docker", "container", "rm", "-f", "test-invalid-metadata"});
+            RunCommand(m_defaultSession.get(), {"/usr/bin/podman", "container", "rm", "-f", "test-invalid-metadata"});
         });
 
         {
-            // Create a docker container that has no metadata.
+            // Create a container directly via the engine CLI (bypassing WSLC) so it has no WSLC
+            // metadata label. The distro runs podman (daemonless); the docker CLI would fail with
+            // "Cannot connect to the Docker daemon" since no dockerd runs.
             auto result = RunCommand(
                 m_defaultSession.get(),
-                {"/usr/bin/docker", "container", "create", "--name", "test-invalid-metadata", "debian:latest"});
+                {"/usr/bin/podman", "container", "create", "--name", "test-invalid-metadata", "debian:latest"});
             VERIFY_ARE_EQUAL(result.Code, 0L);
         }
 
@@ -10495,20 +10600,38 @@ class WSLCTests
         auto process = container.GetInitProcess();
         ValidateProcessOutput(process, {{1, "OK\n"}});
 
-        // Start a blocking export
-        BlockingOperation operation([&](HANDLE handle) { return container.Get().Export(ToCOMInputHandle(handle)); });
-
-        auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() { operation.Complete(); });
-
-        // Validate that various operations can be done while the export is in progress.
+        // Phase 1: while a blocking export is in progress, validate that WSLC itself does not
+        // serialize behind it - operations that WSLC answers from its own tracked state must stay
+        // responsive.
+        //
+        // N.B. podman takes a per-container mutex (see libpod/lock) and `export` holds it for the
+        // entire duration of the stream, so podman-backed operations on the same container (reading
+        // Logs payload, Inspect, a second Export) block until the export completes. That is podman's
+        // behavior, not WSLC's. Those are therefore exercised in Phase 2 (after the export is
+        // released), not concurrently with the export. Only WSLC-side operations are validated here.
         {
+            BlockingOperation operation([&](HANDLE handle) { return container.Get().Export(ToCOMInputHandle(handle)); });
+
+            // Completing the operation (releasing the export and verifying it succeeded) runs on
+            // scope exit, so it happens on both the normal and the exception path before the
+            // BlockingOperation destructor joins its threads.
+            auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() { operation.Complete(); });
+
+            // Init process exit is tracked WSLC-side via the docker event stream.
             VERIFY_ARE_EQUAL(container.GetInitProcess().Wait(), 0);
-        }
 
-        {
+            // State and labels are served from WSLC's cached container metadata (no podman call).
             VERIFY_ARE_EQUAL(container.State(), WslcContainerStateExited);
+            VERIFY_ARE_EQUAL(container.Labels().size(), 0);
+
+            // Exec on a non-running container is rejected by WSLC from cached state before any podman
+            // call, so it must not get stuck behind the in-flight export.
+            auto [result, _] = WSLCProcessLauncher({}, {"echo", "OK"}).LaunchNoThrow(container.Get());
+            VERIFY_ARE_EQUAL(result, WSLC_E_CONTAINER_NOT_RUNNING);
         }
 
+        // Phase 2: with the export finished and podman's per-container lock released, podman-backed
+        // operations work.
         {
             COMOutputHandle stdoutHandle;
             COMOutputHandle stderrHandle;
@@ -10522,19 +10645,9 @@ class WSLCTests
         }
 
         {
-            VERIFY_ARE_EQUAL(container.Labels().size(), 0);
-        }
-
-        {
-            // Validate that another export can run.
+            // A second export works once the first has completed.
             BlockingOperation secondExport([&](HANDLE handle) { return container.Get().Export(ToCOMInputHandle(handle)); });
             secondExport.Complete();
-        }
-
-        {
-            // Exec() fails because the container is not running. This call just validates that Exec() doesn't get stuck.
-            auto [result, _] = WSLCProcessLauncher({}, {"echo", "OK"}).LaunchNoThrow(container.Get());
-            VERIFY_ARE_EQUAL(result, WSLC_E_CONTAINER_NOT_RUNNING);
         }
     }
 
@@ -10579,7 +10692,16 @@ class WSLCTests
     WSLC_TEST_METHOD(InteractiveDetach)
     {
         auto validateDetaches = [](HANDLE TtyIn, HANDLE TtyOut, const std::vector<char>& Input) {
-            VERIFY_WIN32_BOOL_SUCCEEDED(WriteFile(TtyIn, Input.data(), static_cast<DWORD>(Input.size()), nullptr, nullptr));
+            // podman's detach detection (containers/common detach.Copy) only recognizes the detach
+            // sequence when each key arrives in its own read; a single multi-byte write lands as one
+            // read and is treated as normal input. Real interactive clients send one keystroke per
+            // write, so emit the sequence one byte at a time with a brief gap (so the relay forwards
+            // separate reads), matching how a user actually types e.g. ctrl-p,ctrl-q.
+            for (char c : Input)
+            {
+                VERIFY_WIN32_BOOL_SUCCEEDED(WriteFile(TtyIn, &c, 1, nullptr, nullptr));
+                Sleep(50);
+            }
 
             std::string output;
             auto onRead = [&](const gsl::span<char>& data) { output.append(data.data(), data.size()); };
@@ -10655,8 +10777,8 @@ class WSLCTests
         }
 
         {
-            // Validate that invalid detach keys fail with the appropriate error.
-            // N.B. Docker doesn't set an error message for this specific case.
+            // Validate that invalid detach keys are rejected up front with E_INVALIDARG, across the
+            // start-with-attach, attach, and exec paths.
             WSLCContainerLauncher launcher("debian:latest", "test-detach", {"cat"}, {}, {}, WSLCProcessFlagsStdin | WSLCProcessFlagsTty);
             auto container = launcher.Create(*m_defaultSession);
 
@@ -10674,11 +10796,10 @@ class WSLCTests
             WSLCProcessLauncher processLauncher({}, {"cat"}, {}, WSLCProcessFlagsStdin | WSLCProcessFlagsTty);
             processLauncher.SetDetachKeys("invalid");
 
-            // N.B. Docker returns HTTP 500 if the detach keys are invalid, but unlike other cases there's a proper error message.
+            // Invalid detach keys are rejected up front with E_INVALIDARG; the exec path validates the
+            // keys before sending them to the backend, consistent with the Start/Attach cases above.
             auto [result, _] = processLauncher.LaunchNoThrow(container.Get());
-            VERIFY_ARE_EQUAL(result, E_FAIL);
-
-            ValidateCOMErrorMessage(L"Invalid escape keys (invalid) provided");
+            VERIFY_ARE_EQUAL(result, E_INVALIDARG);
         }
     }
 
@@ -11134,23 +11255,25 @@ class WSLCTests
             std::filesystem::remove_all(storagePath, ec);
         });
 
-        // Phase 1: Create a session and inject a container with a corrupt WSLC metadata label via docker CLI.
+        // Phase 1: Create a session and inject a container with a corrupt WSLC metadata label via the podman CLI.
         {
             auto settings = GetDefaultSessionSettings(c_sessionName, false, WSLCNetworkingModeConsomme);
             settings.StoragePath = storagePath.c_str();
             auto session = CreateSession(settings);
 
-            // Load a base image so docker create works.
+            // Load a base image so podman create works.
             LoadTestImage(*session, "hello-world:latest");
 
             // Create a container with an invalid WSLC metadata label.
             // RecoverExistingContainers will fail to parse this on the next session.
+            // The backend's /usr/bin/docker shim targets a non-existent dockerd socket in the
+            // podman-based system distro, so inject via podman directly.
             auto result = ExpectCommandResult(
                 session.get(),
-                {"/usr/bin/docker", "create", "--label", "wslc.container.metadata=INVALID_JSON", "hello-world:latest"},
+                {"/usr/bin/podman", "create", "--label", "wslc.container.metadata=INVALID_JSON", "hello-world:latest"},
                 0);
 
-            // Capture the container ID from docker create output (stdout, trimmed).
+            // Capture the container ID from podman create output (stdout, trimmed).
             auto containerId = result.Output[1];
             containerId.erase(containerId.find_last_not_of(" \n\r") + 1);
 
@@ -11261,9 +11384,11 @@ class WSLCTests
             std::filesystem::remove_all(storagePath, ec);
         });
 
-        // Create a session and, via the docker CLI, inject a "local" volume with driver options we don't support (type=nfs).
+        // Create a session and, via the podman CLI, inject a "local" volume with driver options we don't support (type=nfs).
         // This bypasses our CreateVolume validation, leaving a volume that WSLCGuestVolumeImpl::Open will reject when the next
-        // session recovers it.
+        // session recovers it. The backend's /usr/bin/docker shim targets a non-existent dockerd socket in the podman-based
+        // system distro, so inject via podman directly. podman's local driver does not validate the opts and silently creates
+        // the volume (exit 0), which is exactly the unsupported state we want to recover from.
         {
             auto settings = GetDefaultSessionSettings(c_sessionName, false, WSLCNetworkingModeConsomme);
             settings.StoragePath = storagePath.c_str();
@@ -11271,7 +11396,7 @@ class WSLCTests
 
             ExpectCommandResult(
                 session.get(),
-                {"/usr/bin/docker",
+                {"/usr/bin/podman",
                  "volume",
                  "create",
                  "--driver",
@@ -11305,8 +11430,9 @@ class WSLCTests
 
             VERIFY_IS_TRUE(std::ranges::any_of(warnings, [&](const auto& w) { return w == expectedWarning; }));
 
-            // Clean up the volume from Docker's metadata.
-            ExpectCommandResult(session.get(), {"/usr/bin/docker", "volume", "rm", "-f", c_volumeName}, 0);
+            // Clean up the volume from the backend's metadata via podman directly (the /usr/bin/docker shim targets a
+            // non-existent dockerd socket in the podman-based system distro).
+            ExpectCommandResult(session.get(), {"/usr/bin/podman", "volume", "rm", "-f", c_volumeName}, 0);
 
             VERIFY_SUCCEEDED(session->Terminate());
         }

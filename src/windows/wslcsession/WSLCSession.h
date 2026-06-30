@@ -285,16 +285,20 @@ private:
     void OnVmExited();
     ServiceRunningProcess StartProcess(
         const std::string& Executable, const std::vector<std::string>& Args, PCSTR LogSource, std::function<void()>&& ExitCallback);
+    void StartPodmanSystemService();
     void InstallTrustedRootCertificates();
-    void StartContainerd();
-    void StartDockerd();
     int StopProcess(ServiceRunningProcess& Process, DWORD TerminateTimeoutMs, DWORD KillTimeoutMs);
-    std::optional<std::string> ImportImageImpl(DockerHTTPClient::HTTPRequestContext& Request, const WSLCHandle ImageHandle);
+    void ImportImageImpl(
+        DockerHTTPClient::HTTPRequestContext& Request,
+        std::function<void(const gsl::span<char>&)>&& OnResponseChunk,
+        std::function<void()>&& OnResponseComplete);
     void RecoverExistingContainers();
     void RecoverExistingNetworks();
 
     void SaveImageImpl(std::pair<uint32_t, wil::unique_socket>& RequestCodePair, WSLCHandle OutputHandle, HANDLE CancelEvent);
     void StreamImageOperation(DockerHTTPClient::HTTPRequestContext& requestContext, LPCSTR Image, LPCSTR OperationName, IProgressCallback* ProgressCallback);
+
+    void MountEngineNetworkStorageOverlay();
 
     std::optional<DockerHTTPClient> m_dockerClient;
     std::optional<WSLCVirtualMachine> m_virtualMachine;
@@ -323,8 +327,7 @@ private:
     std::wstring m_terminationDetails;
     wil::srwlock m_lock;
     IORelay m_ioRelay;
-    std::optional<ServiceRunningProcess> m_containerdProcess;
-    std::optional<ServiceRunningProcess> m_dockerdProcess;
+    std::optional<ServiceRunningProcess> m_podmanSystemServiceProcess;
     WSLCFeatureFlags m_featureFlags{};
     std::function<void()> m_destructionCallback;
     std::atomic<bool> m_terminating{false};

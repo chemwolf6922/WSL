@@ -64,22 +64,39 @@ DockerEventTracker::EventTrackingReference::~EventTrackingReference() noexcept
 DockerEventTracker::DockerEventTracker(DockerHTTPClient& dockerClient, WSLCSession& session, IORelay& relay) : m_session(session)
 {
     auto onChunk = [this](const gsl::span<char>& buffer) {
-        if (!buffer.empty()) // docker inserts empty lines between events, skip those.
+        // docker/podman /events is newline-delimited JSON. A single event can span multiple HTTP
+        // chunks - podman flushes large events (e.g. a container with a big label whose create event
+        // carries the labels) at ~8KB boundaries - so accumulate chunk bytes and only parse complete,
+        // newline-terminated events. Parsing a partial chunk as a whole event would throw and silently
+        // drop the event, which previously caused WaitForObjectCreated to time out for large events.
+        m_eventBuffer.append(buffer.data(), buffer.size());
+
+        size_t start = 0;
+        for (size_t newline; (newline = m_eventBuffer.find('\n', start)) != std::string::npos; start = newline + 1)
         {
+            auto event = std::string_view(m_eventBuffer).substr(start, newline - start);
+            if (event.empty()) // docker inserts empty lines between events, skip those.
+            {
+                continue;
+            }
+
             try
             {
-                OnEvent(std::string_view(buffer.data(), buffer.size()));
+                OnEvent(event);
             }
             catch (...)
             {
                 WSL_LOG(
                     "DockerEventParseError",
                     TraceLoggingCountedString(
-                        buffer.data(), static_cast<UINT16>(std::min(buffer.size(), static_cast<size_t>(USHRT_MAX))), "Data"),
+                        event.data(), static_cast<UINT16>(std::min(event.size(), static_cast<size_t>(USHRT_MAX))), "Data"),
                     TraceLoggingValue(wil::ResultFromCaughtException(), "Error"),
                     TraceLoggingValue(m_session.Id(), "SessionId"));
             }
         }
+
+        // Retain any incomplete trailing event for the next chunk.
+        m_eventBuffer.erase(0, start);
     };
 
     auto socket = dockerClient.MonitorEvents();
@@ -141,7 +158,7 @@ void DockerEventTracker::OnEvent(const std::string_view& event)
                 m_createdObjects.insert(objectId);
                 m_objectCreated.SetEvent();
             }
-            else if (actionStr == "destroy")
+            else if (actionStr == "remove")
             {
                 std::lock_guard lock{m_lock};
                 m_createdObjects.erase(objectId);
@@ -153,7 +170,7 @@ void DockerEventTracker::OnEvent(const std::string_view& event)
 void DockerEventTracker::OnContainerEvent(const nlohmann::json& parsed, const std::string& action, std::uint64_t eventTime)
 {
     static std::map<std::string, ContainerEvent> events{
-        {"start", ContainerEvent::Start}, {"die", ContainerEvent::Stop}, {"destroy", ContainerEvent::Destroy}, {"exec_die", ContainerEvent::ExecDied}};
+        {"start", ContainerEvent::Start}, {"die", ContainerEvent::Stop}, {"remove", ContainerEvent::Destroy}, {"exec_died", ContainerEvent::ExecDied}};
 
     auto actor = parsed.find("Actor");
     THROW_HR_IF_MSG(E_INVALIDARG, actor == parsed.end(), "Missing Actor in container event");
@@ -170,7 +187,6 @@ void DockerEventTracker::OnContainerEvent(const nlohmann::json& parsed, const st
     }
 
     std::optional<int> exitCode;
-    std::optional<std::string> execId;
     auto attributes = actor->find("Attributes");
     if (attributes != actor->end())
     {
@@ -179,19 +195,13 @@ void DockerEventTracker::OnContainerEvent(const nlohmann::json& parsed, const st
         {
             exitCode = std::stoi(exitCodeEntry->get<std::string>());
         }
-
-        auto execIdEntry = attributes->find("execID");
-        if (execIdEntry != attributes->end())
-        {
-            execId = execIdEntry->get<std::string>();
-        }
     }
 
     std::lock_guard lock{m_lock};
 
     for (const auto& e : m_containerCallbacks)
     {
-        if (e.ContainerId == containerId && (!e.ExecId.has_value() || e.ExecId == execId))
+        if (e.ContainerId == containerId)
         {
             e.Callback(it->second, exitCode, eventTime);
         }
@@ -200,7 +210,7 @@ void DockerEventTracker::OnContainerEvent(const nlohmann::json& parsed, const st
 
 void DockerEventTracker::OnVolumeEvent(const nlohmann::json& parsed, const std::string& action, std::uint64_t eventTime)
 {
-    static std::map<std::string, VolumeEvent> events{{"create", VolumeEvent::Create}, {"destroy", VolumeEvent::Destroy}};
+    static std::map<std::string, VolumeEvent> events{{"create", VolumeEvent::Create}, {"remove", VolumeEvent::Destroy}};
 
     auto it = events.find(action);
     if (it == events.end())
@@ -256,18 +266,17 @@ DockerEventTracker::EventTrackingReference DockerEventTracker::RegisterContainer
     std::lock_guard lock{m_lock};
 
     auto id = m_callbackId++;
-    m_containerCallbacks.emplace_back(id, ContainerId, std::optional<std::string>{}, std::move(Callback));
+    m_containerCallbacks.emplace_back(id, ContainerId, std::move(Callback));
 
     return EventTrackingReference{this, id};
 }
 
-DockerEventTracker::EventTrackingReference DockerEventTracker::RegisterExecStateUpdates(
-    const std::string& ContainerId, const std::string& ExecId, ContainerStateChangeCallback&& Callback) noexcept
+DockerEventTracker::EventTrackingReference DockerEventTracker::RegisterExecStateUpdates(const std::string& ContainerId, ContainerStateChangeCallback&& Callback) noexcept
 {
     std::lock_guard lock{m_lock};
 
     auto id = m_callbackId++;
-    m_containerCallbacks.emplace_back(id, ContainerId, ExecId, std::move(Callback));
+    m_containerCallbacks.emplace_back(id, ContainerId, std::move(Callback));
 
     return EventTrackingReference{this, id};
 }
