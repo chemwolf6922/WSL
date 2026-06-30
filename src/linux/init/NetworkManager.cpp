@@ -618,7 +618,7 @@ try
     sockaddr_in6 dst{};
     dst.sin6_family = AF_INET6;
     dst.sin6_port = htons(9); // discard
-    THROW_HR_IF(E_UNEXPECTED, inet_pton(AF_INET6, "ff0e::1", &dst.sin6_addr) != 1);
+    THROW_ERRNO_IF(EINVAL, inet_pton(AF_INET6, "ff0e::1", &dst.sin6_addr) != 1);
 
     const char payload = 0;
     THROW_LAST_ERROR_IF(sendto(sock.get(), &payload, sizeof(payload), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0);
