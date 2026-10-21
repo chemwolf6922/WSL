@@ -9,6 +9,7 @@ set(SOURCES
 
     # Session and container implementation
     WSLCSession.cpp
+    WSLCSessionRuntime.cpp
     WSLCContainer.cpp
     WSLCVirtualMachine.cpp
 
@@ -25,6 +26,7 @@ set(SOURCES
     # Supporting classes
     DockerEventTracker.cpp
     DockerHTTPClient.cpp
+    EventStore.cpp
     IORelay.cpp
     OptionParser.cpp
     ServiceProcessLauncher.cpp
@@ -34,6 +36,7 @@ set(SOURCES
 set(HEADERS
     DockerEventTracker.h
     DockerHTTPClient.h
+    EventStore.h
     IORelay.h
     OptionParser.h
     ServiceProcessLauncher.h
@@ -44,6 +47,8 @@ set(HEADERS
     WSLCProcessControl.h
     WSLCProcessIO.h
     WSLCSession.h
+    WSLCSessionRuntime.h
+    WSLCIdleState.h
     WSLCSessionFactory.h
     WSLCSessionReference.h
     WSLCVirtualMachine.h
