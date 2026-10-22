@@ -1026,6 +1026,13 @@ int WSLCEntryPoint(int Argc, char* Argv[])
         g_LogFd = 3;
     }
 
+    // The fresh devtmpfs must expose stdin for tools such as nft.
+    if (symlink("/proc/self/fd/0", "/dev/stdin") < 0 && errno != EEXIST)
+    {
+        LOG_ERROR("symlink(/proc/self/fd/0, /dev/stdin) failed {}", errno);
+        return -1;
+    }
+
     //
     // Increase the soft and hard limit for number of open file descriptors.
     // N.B. the soft limit shouldn't be too high. See https://github.com/microsoft/WSL/issues/12985 .

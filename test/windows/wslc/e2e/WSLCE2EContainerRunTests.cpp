@@ -92,9 +92,7 @@ class WSLCE2EContainerRunTests
         VerifyContainerIsListed(WslcContainerName, L"exited");
     }
 
-    // Blocks the Podman 6.1.4 evaluation in cleanup after a network-start failure.
-    // WSLC_TEST_METHOD(WSLCE2E_Container_Run_CIDFile_Valid)
-    void WSLCE2E_Container_Run_CIDFile_Valid()
+    WSLC_TEST_METHOD(WSLCE2E_Container_Run_CIDFile_Valid)
     {
         // Prepare a CID file path that does not exist
         const auto cidFilePath = wsl::windows::common::filesystem::GetTempFilename();
